@@ -1201,3 +1201,234 @@ func TestLockCommand_OutputContract_NoExtraOutput(t *testing.T) {
 		t.Errorf("output should have exactly one newline, got: %q", stdoutStr)
 	}
 }
+
+func TestShredFile_RemovesFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "to-shred.txt")
+	testContent := []byte("secret data that should be shredded")
+
+	if err := os.WriteFile(testFile, testContent, 0600); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	// Verify file exists before shredding
+	if _, err := os.Stat(testFile); os.IsNotExist(err) {
+		t.Fatal("test file should exist before shredding")
+	}
+
+	warnings := shredFile(testFile)
+
+	// Should complete without warnings
+	if len(warnings) > 0 {
+		t.Errorf("expected no warnings, got: %v", warnings)
+	}
+
+	// File should no longer exist
+	if _, err := os.Stat(testFile); !os.IsNotExist(err) {
+		t.Error("file should not exist after shredding")
+	}
+}
+
+func TestShredFile_HandlesErrors(t *testing.T) {
+	// Try to shred a non-existent file
+	nonExistent := "/tmp/seal-test-nonexistent-file-for-shred.txt"
+	warnings := shredFile(nonExistent)
+
+	// Should return warnings but not panic
+	if len(warnings) == 0 {
+		t.Error("expected warnings when shredding non-existent file")
+	}
+
+	// Warning should mention the failure
+	if !strings.Contains(warnings[0], "warning:") {
+		t.Errorf("expected warning message, got: %q", warnings[0])
+	}
+}
+
+func TestLockCommand_Shred_Success(t *testing.T) {
+	binPath := filepath.Join(t.TempDir(), "seal-test")
+	buildCmd := exec.Command("go", "build", "-o", binPath)
+	if output, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to build binary: %v\n%s", err, output)
+	}
+
+	tmpHome := t.TempDir()
+	testFile := filepath.Join(tmpHome, "secret.txt")
+	testContent := []byte("secret data to seal and shred")
+
+	if err := os.WriteFile(testFile, testContent, 0600); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	// Verify file exists
+	if _, err := os.Stat(testFile); os.IsNotExist(err) {
+		t.Fatal("test file should exist before sealing")
+	}
+
+	// Run seal lock with --shred
+	cmd := exec.Command(binPath, "lock", "--until", "2027-12-31T23:59:59Z", "--shred", testFile)
+	cmd.Env = append(os.Environ(), "HOME="+tmpHome, "XDG_DATA_HOME=")
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("seal lock failed: %v\nstderr: %s", err, stderr.String())
+	}
+
+	// Stdout should contain only ID
+	stdoutStr := stdout.String()
+	stdoutTrimmed := strings.TrimSpace(stdoutStr)
+	uuidRegex := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	if !uuidRegex.MatchString(stdoutTrimmed) {
+		t.Errorf("stdout should contain only UUID, got: %q", stdoutStr)
+	}
+
+	// Stderr should contain the mandatory warning
+	stderrStr := stderr.String()
+	if !strings.Contains(stderrStr, "warning: file shredding on modern filesystems is best-effort only.") {
+		t.Errorf("stderr should contain shredding warning, got: %q", stderrStr)
+	}
+
+	if !strings.Contains(stderrStr, "backups, snapshots, wear leveling, and caches may retain data.") {
+		t.Errorf("stderr should contain complete shredding warning, got: %q", stderrStr)
+	}
+
+	// Original file should be removed
+	if _, err := os.Stat(testFile); !os.IsNotExist(err) {
+		t.Error("original file should be removed after shredding")
+	}
+}
+
+func TestLockCommand_Shred_FailureDoesNotAbortSealing(t *testing.T) {
+	binPath := filepath.Join(t.TempDir(), "seal-test")
+	buildCmd := exec.Command("go", "build", "-o", binPath)
+	if output, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to build binary: %v\n%s", err, output)
+	}
+
+	tmpHome := t.TempDir()
+	testFile := filepath.Join(tmpHome, "secret.txt")
+	testContent := []byte("test data")
+
+	if err := os.WriteFile(testFile, testContent, 0600); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	// Make file read-only to cause shredding to fail
+	if err := os.Chmod(testFile, 0400); err != nil {
+		t.Fatalf("failed to make file read-only: %v", err)
+	}
+
+	// Run seal lock with --shred
+	cmd := exec.Command(binPath, "lock", "--until", "2027-12-31T23:59:59Z", "--shred", testFile)
+	cmd.Env = append(os.Environ(), "HOME="+tmpHome, "XDG_DATA_HOME=")
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	// Should succeed despite shredding failure
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("seal lock should succeed even if shredding fails: %v\nstderr: %s", err, stderr.String())
+	}
+
+	// Stdout should still contain the sealed item ID
+	stdoutStr := stdout.String()
+	stdoutTrimmed := strings.TrimSpace(stdoutStr)
+	uuidRegex := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	if !uuidRegex.MatchString(stdoutTrimmed) {
+		t.Errorf("stdout should contain UUID even on shred failure, got: %q", stdoutStr)
+	}
+
+	// Stderr should contain both the mandatory warning and shredding failure warning
+	stderrStr := stderr.String()
+	if !strings.Contains(stderrStr, "warning: file shredding on modern filesystems is best-effort only.") {
+		t.Errorf("stderr should contain mandatory warning, got: %q", stderrStr)
+	}
+
+	if !strings.Contains(stderrStr, "warning:") {
+		t.Errorf("stderr should contain shredding failure warning, got: %q", stderrStr)
+	}
+
+	// Clean up - restore write permissions and remove file
+	os.Chmod(testFile, 0600)
+	os.Remove(testFile)
+}
+
+func TestLockCommand_Shred_ErrorWithStdin(t *testing.T) {
+	binPath := filepath.Join(t.TempDir(), "seal-test")
+	buildCmd := exec.Command("go", "build", "-o", binPath)
+	if output, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to build binary: %v\n%s", err, output)
+	}
+
+	tmpHome := t.TempDir()
+
+	// Run seal lock with --shred on stdin input (should error)
+	cmd := exec.Command(binPath, "lock", "--until", "2027-12-31T23:59:59Z", "--shred")
+	cmd.Stdin = strings.NewReader("test content")
+	cmd.Env = append(os.Environ(), "HOME="+tmpHome, "XDG_DATA_HOME=")
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	// Should fail with error
+	err := cmd.Run()
+	if err == nil {
+		t.Fatal("seal lock with --shred and stdin should fail")
+	}
+
+	// Stdout should be empty
+	if stdout.String() != "" {
+		t.Errorf("stdout should be empty on error, got: %q", stdout.String())
+	}
+
+	// Stderr should contain the error
+	stderrStr := stderr.String()
+	if !strings.Contains(stderrStr, "error: --shred can only be used with file input") {
+		t.Errorf("stderr should contain shred+stdin error, got: %q", stderrStr)
+	}
+}
+
+func TestLockCommand_Shred_WarningNotSuppressible(t *testing.T) {
+	binPath := filepath.Join(t.TempDir(), "seal-test")
+	buildCmd := exec.Command("go", "build", "-o", binPath)
+	if output, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to build binary: %v\n%s", err, output)
+	}
+
+	tmpHome := t.TempDir()
+	testFile := filepath.Join(tmpHome, "test.txt")
+
+	if err := os.WriteFile(testFile, []byte("test"), 0600); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	// Run with --shred - warning must appear
+	cmd := exec.Command(binPath, "lock", "--until", "2027-12-31T23:59:59Z", "--shred", testFile)
+	cmd.Env = append(os.Environ(), "HOME="+tmpHome, "XDG_DATA_HOME=")
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("seal lock failed: %v\nstderr: %s", err, stderr.String())
+	}
+
+	stderrStr := stderr.String()
+
+	// Warning must always appear when --shred is used
+	if !strings.Contains(stderrStr, "warning: file shredding on modern filesystems is best-effort only.") {
+		t.Error("mandatory warning must appear when --shred is used")
+	}
+
+	// Verify it appears exactly once (not multiple times)
+	warningCount := strings.Count(stderrStr, "warning: file shredding on modern filesystems is best-effort only.")
+	if warningCount != 1 {
+		t.Errorf("warning should appear exactly once, appeared %d times", warningCount)
+	}
+}

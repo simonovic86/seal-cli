@@ -53,12 +53,13 @@ type SealedItem struct {
 const usageText = `seal - irreversible time-locked commitment primitive
 
 Usage:
-  seal lock <path> --until <time>
+  seal lock <path> --until <time> [--shred]
   seal lock --until <time>          (reads from stdin)
   seal status
 
 Options:
   --until <time>    RFC3339 timestamp for unlock time
+  --shred           best-effort file shredding (file input only)
 
 seal lock encrypts data until a specified future time.
 seal status shows information about sealed commitments.
@@ -223,6 +224,62 @@ func encryptPayload(plaintext []byte) (ciphertext []byte, nonceB64 string, err e
 	return ciphertext, nonceB64, nil
 }
 
+// shredFile performs best-effort file shredding.
+// Overwrites the file with zeroes, syncs, and removes it.
+// Returns a slice of warnings encountered (does not fail on errors).
+func shredFile(path string) []string {
+	var warnings []string
+
+	// Open file for writing
+	file, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		warnings = append(warnings, fmt.Sprintf("warning: failed to open file for shredding: %v", err))
+		return warnings
+	}
+	defer file.Close()
+
+	// Get file size
+	info, err := file.Stat()
+	if err != nil {
+		warnings = append(warnings, fmt.Sprintf("warning: failed to stat file for shredding: %v", err))
+		return warnings
+	}
+
+	size := info.Size()
+
+	// Overwrite with zeroes (single pass)
+	zeroes := make([]byte, 4096) // Use 4KB buffer for efficiency
+	var written int64
+	for written < size {
+		toWrite := int64(len(zeroes))
+		if written+toWrite > size {
+			toWrite = size - written
+		}
+
+		n, err := file.Write(zeroes[:toWrite])
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("warning: failed to overwrite file during shredding: %v", err))
+			return warnings
+		}
+		written += int64(n)
+	}
+
+	// Sync to disk
+	if err := file.Sync(); err != nil {
+		warnings = append(warnings, fmt.Sprintf("warning: failed to sync file during shredding: %v", err))
+	}
+
+	file.Close()
+
+	// Remove file
+	if err := os.Remove(path); err != nil {
+		warnings = append(warnings, fmt.Sprintf("warning: failed to remove file after shredding: %v", err))
+		return warnings
+	}
+
+	return warnings
+}
+
 // getSealBaseDir returns the OS-appropriate base directory for Seal data.
 func getSealBaseDir() (string, error) {
 	var baseDir string
@@ -370,9 +427,10 @@ func listSealedItems() ([]SealedItem, error) {
 func handleLock(args []string) {
 	lockFlags := flag.NewFlagSet("lock", flag.ExitOnError)
 	until := lockFlags.String("until", "", "RFC3339 timestamp for unlock time")
+	shred := lockFlags.Bool("shred", false, "best-effort file shredding (file input only)")
 
 	lockFlags.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: seal lock <path> --until <time>")
+		fmt.Fprintln(os.Stderr, "Usage: seal lock <path> --until <time> [--shred]")
 		fmt.Fprintln(os.Stderr, "       seal lock --until <time>  (reads from stdin)")
 		lockFlags.PrintDefaults()
 	}
@@ -404,10 +462,22 @@ func handleLock(args []string) {
 		inputPath = remaining[0]
 	}
 
+	// Validate --shred usage
+	if *shred && inputPath == "" {
+		fmt.Fprintln(os.Stderr, "error: --shred can only be used with file input")
+		os.Exit(1)
+	}
+
 	inputData, inputSrc, err := readInput(inputPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
+	}
+
+	// Print mandatory warning if shredding
+	if *shred {
+		fmt.Fprintln(os.Stderr, "warning: file shredding on modern filesystems is best-effort only.")
+		fmt.Fprintln(os.Stderr, "backups, snapshots, wear leveling, and caches may retain data.")
 	}
 
 	// Create sealed item with encrypted payload
@@ -415,6 +485,14 @@ func handleLock(args []string) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
+	}
+
+	// Shred original file if requested (best-effort, after successful sealing)
+	if *shred && inputPath != "" {
+		warnings := shredFile(inputPath)
+		for _, warning := range warnings {
+			fmt.Fprintln(os.Stderr, warning)
+		}
 	}
 
 	fmt.Println(id)
