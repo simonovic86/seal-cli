@@ -580,6 +580,7 @@ func TestMetadata_RoundTrip(t *testing.T) {
 
 	original := SealedItem{
 		ID:            "test-id-123",
+		State:         "sealed",
 		UnlockTime:    unlockTime,
 		InputType:     "stdin",
 		OriginalPath:  "",
@@ -605,6 +606,10 @@ func TestMetadata_RoundTrip(t *testing.T) {
 	// Verify all fields
 	if decoded.ID != original.ID {
 		t.Errorf("ID mismatch: got %s, want %s", decoded.ID, original.ID)
+	}
+
+	if decoded.State != original.State {
+		t.Errorf("State mismatch: got %s, want %s", decoded.State, original.State)
 	}
 
 	if !decoded.UnlockTime.Equal(original.UnlockTime) {
@@ -992,6 +997,7 @@ func TestMetadata_IncludesCryptoFields(t *testing.T) {
 
 	meta := SealedItem{
 		ID:            "test-id-123",
+		State:         "sealed",
 		UnlockTime:    unlockTime,
 		InputType:     "stdin",
 		OriginalPath:  "",
@@ -1705,5 +1711,149 @@ func TestCreateSealedItem_StoresAuthorityMetadata(t *testing.T) {
 
 	if meta.KeyRef != "placeholder-key-ref" {
 		t.Errorf("expected key_ref 'placeholder-key-ref', got %s", meta.KeyRef)
+	}
+}
+
+func TestSealedItem_StateDefaultsToSealed(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldHome := os.Getenv("HOME")
+	oldXDGDataHome := os.Getenv("XDG_DATA_HOME")
+	defer func() {
+		os.Setenv("HOME", oldHome)
+		os.Setenv("XDG_DATA_HOME", oldXDGDataHome)
+	}()
+
+	os.Setenv("HOME", tmpDir)
+	os.Setenv("XDG_DATA_HOME", "")
+
+	unlockTime := time.Now().UTC().Add(24 * time.Hour)
+	plaintext := []byte("test data")
+	authority := &PlaceholderAuthority{}
+
+	id, err := createSealedItem(unlockTime, inputSourceStdin, "", plaintext, authority)
+	if err != nil {
+		t.Fatalf("createSealedItem failed: %v", err)
+	}
+
+	// Read metadata
+	baseDir, _ := getSealBaseDir()
+	metaPath := filepath.Join(baseDir, id, "meta.json")
+	metaData, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("failed to read metadata: %v", err)
+	}
+
+	var meta SealedItem
+	if err := json.Unmarshal(metaData, &meta); err != nil {
+		t.Fatalf("failed to unmarshal metadata: %v", err)
+	}
+
+	// Verify state is "sealed"
+	if meta.State != "sealed" {
+		t.Errorf("expected state 'sealed', got %s", meta.State)
+	}
+}
+
+func TestUnsealedPath_NeverCreated(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldHome := os.Getenv("HOME")
+	oldXDGDataHome := os.Getenv("XDG_DATA_HOME")
+	defer func() {
+		os.Setenv("HOME", oldHome)
+		os.Setenv("XDG_DATA_HOME", oldXDGDataHome)
+	}()
+
+	os.Setenv("HOME", tmpDir)
+	os.Setenv("XDG_DATA_HOME", "")
+
+	unlockTime := time.Now().UTC().Add(24 * time.Hour)
+	plaintext := []byte("test data")
+	authority := &PlaceholderAuthority{}
+
+	id, err := createSealedItem(unlockTime, inputSourceStdin, "", plaintext, authority)
+	if err != nil {
+		t.Fatalf("createSealedItem failed: %v", err)
+	}
+
+	// Verify unsealed path does not exist
+	baseDir, _ := getSealBaseDir()
+	unsealedPath := filepath.Join(baseDir, id, "unsealed")
+
+	if _, err := os.Stat(unsealedPath); !os.IsNotExist(err) {
+		t.Error("unsealed file should not exist for sealed item")
+	}
+
+	// List items (which calls checkAndTransitionUnlock)
+	items, err := listSealedItems()
+	if err != nil {
+		t.Fatalf("listSealedItems failed: %v", err)
+	}
+
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+
+	// State should still be sealed
+	if items[0].State != "sealed" {
+		t.Errorf("state should be sealed, got %s", items[0].State)
+	}
+
+	// Unsealed path should still not exist after status check
+	if _, err := os.Stat(unsealedPath); !os.IsNotExist(err) {
+		t.Error("unsealed file should not exist after status check")
+	}
+}
+
+func TestCheckAndTransitionUnlock_Inert(t *testing.T) {
+	tmpDir := t.TempDir()
+	itemDir := filepath.Join(tmpDir, "test-item")
+
+	unlockTime := time.Now().UTC().Add(24 * time.Hour)
+	createdAt := time.Now().UTC()
+
+	// Test with sealed item
+	sealedItem := SealedItem{
+		ID:            "test-id",
+		State:         "sealed",
+		UnlockTime:    unlockTime,
+		InputType:     "stdin",
+		TimeAuthority: "placeholder",
+		CreatedAt:     createdAt,
+		Algorithm:     "aes-256-gcm",
+		Nonce:         "test-nonce",
+		KeyRef:        "test-ref",
+	}
+
+	result, err := checkAndTransitionUnlock(sealedItem, itemDir)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	// Should remain sealed (inert implementation)
+	if result.State != "sealed" {
+		t.Errorf("state should remain sealed, got %s", result.State)
+	}
+
+	// Test with already unlocked item
+	unlockedItem := SealedItem{
+		ID:            "test-id-2",
+		State:         "unlocked",
+		UnlockTime:    unlockTime,
+		InputType:     "stdin",
+		TimeAuthority: "placeholder",
+		CreatedAt:     createdAt,
+		Algorithm:     "aes-256-gcm",
+		Nonce:         "test-nonce",
+		KeyRef:        "test-ref",
+	}
+
+	result, err = checkAndTransitionUnlock(unlockedItem, itemDir)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	// Should remain unlocked
+	if result.State != "unlocked" {
+		t.Errorf("state should remain unlocked, got %s", result.State)
 	}
 }

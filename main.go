@@ -76,6 +76,7 @@ func (p *PlaceholderAuthority) CanUnlock(ref KeyReference, now time.Time) (bool,
 // SealedItem represents metadata for a sealed item.
 type SealedItem struct {
 	ID              string    `json:"id"`
+	State           string    `json:"state"`
 	UnlockTime      time.Time `json:"unlock_time"`
 	InputType       string    `json:"input_type"`
 	OriginalPath    string    `json:"original_path,omitempty"`
@@ -433,6 +434,7 @@ func createSealedItem(unlockTime time.Time, inputType inputSource, originalPath 
 	// Create metadata
 	meta := SealedItem{
 		ID:            id,
+		State:         "sealed",
 		UnlockTime:    unlockTime.UTC(),
 		InputType:     inputType.String(),
 		OriginalPath:  originalPath,
@@ -463,6 +465,33 @@ func createSealedItem(unlockTime time.Time, inputType inputSource, originalPath 
 	return id, nil
 }
 
+// checkAndTransitionUnlock checks if a sealed item can be unlocked and transitions it.
+// This function defines the unlock flow but is currently inert (does not unlock).
+// 
+// When unlocking is implemented, decrypted data will be written to:
+//   <itemDir>/unsealed
+// 
+// This path must not exist while the item is in "sealed" state.
+// Returns the item (potentially with updated state) and any error.
+func checkAndTransitionUnlock(item SealedItem, itemDir string) (SealedItem, error) {
+	// If already unlocked, do nothing
+	if item.State == "unlocked" {
+		return item, nil
+	}
+
+	// If still sealed, check conditions (currently inert - does not unlock)
+	if item.State == "sealed" {
+		// TODO: check time authority
+		// TODO: decrypt payload
+		// TODO: write to <itemDir>/unsealed
+		// TODO: update state to "unlocked"
+		// For now, do nothing
+		return item, nil
+	}
+
+	return item, nil
+}
+
 // listSealedItems returns all sealed items, sorted by creation time (oldest first).
 func listSealedItems() ([]SealedItem, error) {
 	baseDir, err := getSealBaseDir()
@@ -486,7 +515,8 @@ func listSealedItems() ([]SealedItem, error) {
 			continue
 		}
 
-		metaPath := filepath.Join(baseDir, entry.Name(), "meta.json")
+		itemDir := filepath.Join(baseDir, entry.Name())
+		metaPath := filepath.Join(itemDir, "meta.json")
 		metaData, err := os.ReadFile(metaPath)
 		if err != nil {
 			// Skip invalid items
@@ -496,6 +526,13 @@ func listSealedItems() ([]SealedItem, error) {
 		var item SealedItem
 		if err := json.Unmarshal(metaData, &item); err != nil {
 			// Skip invalid items
+			continue
+		}
+
+		// Check and potentially transition unlock state (currently inert)
+		item, err = checkAndTransitionUnlock(item, itemDir)
+		if err != nil {
+			// Skip items that fail unlock check
 			continue
 		}
 
