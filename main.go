@@ -84,11 +84,31 @@ type DrandKeyReference struct {
 	TargetRound uint64 `json:"target_round"`
 }
 
+// HTTPDoer is an interface for making HTTP requests.
+// This allows injecting mock HTTP clients for testing.
+type HTTPDoer interface {
+	Do(*http.Request) (*http.Response, error)
+}
+
+// TimelockBox abstracts tlock encryption/decryption for testing.
+type TimelockBox interface {
+	// Encrypt time-locks the DEK to the target round.
+	// Returns base64-encoded ciphertext.
+	Encrypt(dek []byte, targetRound uint64) (string, error)
+
+	// Decrypt decrypts the tlock ciphertext.
+	// Ciphertext is base64-encoded.
+	Decrypt(ciphertextB64 string) ([]byte, error)
+}
+
 // DrandAuthority is a time authority based on the drand public randomness beacon.
 type DrandAuthority struct {
 	NetworkName string
 	BaseURL     string
-	info        *drandInfo // cached network info
+	ChainHash   string
+	HTTPClient  HTTPDoer    // injectable HTTP client
+	Timelock    TimelockBox // injectable tlock implementation
+	info        *drandInfo  // cached network info
 }
 
 type drandInfo struct {
@@ -175,7 +195,12 @@ func (d *DrandAuthority) fetchInfo() (*drandInfo, error) {
 	}
 
 	url := d.BaseURL + "/info"
-	resp, err := http.Get(url)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := d.HTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -201,7 +226,12 @@ func (d *DrandAuthority) fetchInfo() (*drandInfo, error) {
 
 func (d *DrandAuthority) fetchLatestRound() (uint64, error) {
 	url := d.BaseURL + "/public/latest"
-	resp, err := http.Get(url)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return 0, err
+	}
+
+	resp, err := d.HTTPClient.Do(req)
 	if err != nil {
 		return 0, err
 	}
@@ -226,7 +256,12 @@ func (d *DrandAuthority) fetchLatestRound() (uint64, error) {
 
 func (d *DrandAuthority) fetchRoundRandomness(round uint64) ([]byte, error) {
 	url := fmt.Sprintf("%s/public/%d", d.BaseURL, round)
-	resp, err := http.Get(url)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := d.HTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -255,11 +290,76 @@ func (d *DrandAuthority) fetchRoundRandomness(round uint64) ([]byte, error) {
 	return randomness, nil
 }
 
+// RealTimelockBox implements TimelockBox using the actual tlock library.
+type RealTimelockBox struct {
+	BaseURL   string
+	ChainHash string
+}
+
+// Encrypt time-locks the DEK using tlock.
+func (r *RealTimelockBox) Encrypt(dek []byte, targetRound uint64) (string, error) {
+	network, err := thttp.NewNetwork(r.BaseURL, r.ChainHash)
+	if err != nil {
+		return "", fmt.Errorf("failed to create tlock network: %w", err)
+	}
+
+	var tlockCiphertext bytes.Buffer
+	dekReader := bytes.NewReader(dek)
+
+	if err := tlock.New(network).Encrypt(&tlockCiphertext, dekReader, targetRound); err != nil {
+		return "", fmt.Errorf("failed to tlock encrypt DEK: %w", err)
+	}
+
+	return base64.StdEncoding.EncodeToString(tlockCiphertext.Bytes()), nil
+}
+
+// Decrypt decrypts the tlock ciphertext.
+func (r *RealTimelockBox) Decrypt(ciphertextB64 string) ([]byte, error) {
+	tlockCiphertext, err := base64.StdEncoding.DecodeString(ciphertextB64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode tlock ciphertext: %w", err)
+	}
+
+	network, err := thttp.NewNetwork(r.BaseURL, r.ChainHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create tlock network: %w", err)
+	}
+
+	var dekBuffer bytes.Buffer
+	tlockReader := bytes.NewReader(tlockCiphertext)
+
+	if err := tlock.New(network).Decrypt(&dekBuffer, tlockReader); err != nil {
+		return nil, err
+	}
+
+	return dekBuffer.Bytes(), nil
+}
+
+// drandQuicknetChainHash is the chain hash for drand quicknet.
+const drandQuicknetChainHash = "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971"
+
 // NewDrandAuthority creates a drand authority for the quicknet network.
 func NewDrandAuthority() *DrandAuthority {
+	return NewDrandAuthorityWithDeps(http.DefaultClient, nil)
+}
+
+// NewDrandAuthorityWithDeps creates a drand authority with injectable dependencies.
+func NewDrandAuthorityWithDeps(httpClient HTTPDoer, timelock TimelockBox) *DrandAuthority {
+	baseURL := "https://api.drand.sh/" + drandQuicknetChainHash
+
+	if timelock == nil {
+		timelock = &RealTimelockBox{
+			BaseURL:   "https://api.drand.sh",
+			ChainHash: drandQuicknetChainHash,
+		}
+	}
+
 	return &DrandAuthority{
 		NetworkName: "quicknet",
-		BaseURL:     "https://api.drand.sh/52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971",
+		BaseURL:     baseURL,
+		ChainHash:   drandQuicknetChainHash,
+		HTTPClient:  httpClient,
+		Timelock:    timelock,
 	}
 }
 
@@ -636,29 +736,20 @@ func createSealedItem(unlockTime time.Time, inputType inputSource, originalPath 
 	}
 
 	// For drand authority, use tlock to time-lock the DEK
-	if authority.Name() == "drand" {
+	if drandAuth, ok := authority.(*DrandAuthority); ok {
 		var drandRef DrandKeyReference
 		if err := json.Unmarshal([]byte(keyRef), &drandRef); err != nil {
 			return "", fmt.Errorf("failed to parse drand key reference: %w", err)
 		}
 
-		// Create drand network client for tlock
-		chainHash := "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971"
-		network, err := thttp.NewNetwork("https://api.drand.sh", chainHash)
-		if err != nil {
-			return "", fmt.Errorf("failed to create tlock network: %w", err)
-		}
-
 		// Time-lock encrypt the DEK to the target round
-		var tlockCiphertext bytes.Buffer
-		dekReader := bytes.NewReader(dek)
-		
-		if err := tlock.New(network).Encrypt(&tlockCiphertext, dekReader, drandRef.TargetRound); err != nil {
-			return "", fmt.Errorf("failed to tlock encrypt DEK: %w", err)
+		tlockB64, err := drandAuth.Timelock.Encrypt(dek, drandRef.TargetRound)
+		if err != nil {
+			return "", err
 		}
 
 		// Store tlock-encrypted DEK in metadata (base64 encoded)
-		meta.DEKTlockB64 = base64.StdEncoding.EncodeToString(tlockCiphertext.Bytes())
+		meta.DEKTlockB64 = tlockB64
 	}
 
 	// Write metadata
@@ -715,29 +806,18 @@ func tryMaterialize(item SealedItem, itemDir string, authority TimeAuthority) (S
 		return item, errors.New("tlock-encrypted DEK not found")
 	}
 
-	// Decode tlock ciphertext from base64
-	tlockCiphertext, err := base64.StdEncoding.DecodeString(item.DEKTlockB64)
-	if err != nil {
-		return item, fmt.Errorf("failed to decode tlock ciphertext: %w", err)
-	}
-
-	// Create drand network client for tlock
-	chainHash := "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971"
-	network, err := thttp.NewNetwork("https://api.drand.sh", chainHash)
-	if err != nil {
-		return item, fmt.Errorf("failed to create tlock network: %w", err)
+	// Get the DrandAuthority to access its Timelock
+	drandAuth, ok := authority.(*DrandAuthority)
+	if !ok {
+		return item, errors.New("expected DrandAuthority for drand items")
 	}
 
 	// Decrypt DEK using tlock (fetches drand beacon for target round)
-	var dekBuffer bytes.Buffer
-	tlockReader := bytes.NewReader(tlockCiphertext)
-
-	if err := tlock.New(network).Decrypt(&dekBuffer, tlockReader); err != nil {
+	dek, err := drandAuth.Timelock.Decrypt(item.DEKTlockB64)
+	if err != nil {
 		// Decryption failure (too early or network error) - do not unlock
 		return item, nil
 	}
-
-	dek := dekBuffer.Bytes()
 	defer func() {
 		// Zero out DEK from memory
 		for i := range dek {
@@ -833,7 +913,7 @@ func checkAndTransitionUnlock(item SealedItem, itemDir string) (SealedItem, erro
 	// Get authority based on item metadata
 	var authority TimeAuthority
 	if item.TimeAuthority == "drand" {
-		authority = NewDrandAuthority()
+		authority = newDefaultDrandAuthority()
 	} else {
 		// Placeholder or unknown authority - no materialization
 		return item, nil
@@ -965,7 +1045,7 @@ func handleLock(args []string) {
 	}
 
 	// Create time authority (default: drand quicknet)
-	authority := NewDrandAuthority()
+	authority := newDefaultDrandAuthority()
 
 	// Create sealed item with encrypted payload
 	id, err := createSealedItem(unlockTime, inputSrc, inputPath, inputData, authority)

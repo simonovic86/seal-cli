@@ -6,6 +6,8 @@ import (
 	"crypto/cipher"
 	"encoding/base64"
 	"encoding/json"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +17,140 @@ import (
 	"testing"
 	"time"
 )
+
+// FakeHTTPDoer is a mock HTTP client for testing.
+type FakeHTTPDoer struct {
+	// Responses maps URL path suffixes to responses
+	Responses map[string]*http.Response
+	// Errors maps URL path suffixes to errors
+	Errors map[string]error
+}
+
+func (f *FakeHTTPDoer) Do(req *http.Request) (*http.Response, error) {
+	path := req.URL.Path
+	// Check for path suffix matches
+	for suffix, err := range f.Errors {
+		if strings.HasSuffix(path, suffix) {
+			return nil, err
+		}
+	}
+	for suffix, resp := range f.Responses {
+		if strings.HasSuffix(path, suffix) {
+			// Clone the response body for reuse
+			return cloneResponse(resp), nil
+		}
+	}
+	// Return 404 for unknown paths
+	return &http.Response{
+		StatusCode: http.StatusNotFound,
+		Body:       io.NopCloser(strings.NewReader("not found")),
+	}, nil
+}
+
+// cloneResponse creates a copy of an http.Response with a fresh body reader.
+func cloneResponse(resp *http.Response) *http.Response {
+	// We need to clone the response because the body can only be read once
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	// Reset the original response body for potential future reuse
+	resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	
+	return &http.Response{
+		StatusCode: resp.StatusCode,
+		Body:       io.NopCloser(bytes.NewReader(bodyBytes)),
+	}
+}
+
+// makeDrandInfoResponse creates a fake drand /info response.
+func makeDrandInfoResponse() *http.Response {
+	info := drandInfo{
+		Period:      3,
+		GenesisTime: 1677685200, // Fixed genesis time for deterministic tests
+		Hash:        "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971",
+		SchemeID:    "bls-unchained-on-g1",
+		BeaconID:    "quicknet",
+	}
+	body, _ := json.Marshal(info)
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(bytes.NewReader(body)),
+	}
+}
+
+// makeDrandPublicResponse creates a fake drand /public/latest or /public/<round> response.
+func makeDrandPublicResponse(round uint64) *http.Response {
+	resp := drandPublicResponse{
+		Round:      round,
+		Randomness: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+	}
+	body, _ := json.Marshal(resp)
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(bytes.NewReader(body)),
+	}
+}
+
+// FakeTimelockBox is a mock tlock implementation for testing.
+// It uses a simple reversible encoding (base64 with prefix) instead of actual encryption.
+type FakeTimelockBox struct {
+	// EncryptError can be set to simulate encryption failures
+	EncryptError error
+	// DecryptError can be set to simulate decryption failures
+	DecryptError error
+	// DecryptedDEK can be set to return a specific DEK on decrypt
+	DecryptedDEK []byte
+}
+
+func (f *FakeTimelockBox) Encrypt(dek []byte, targetRound uint64) (string, error) {
+	if f.EncryptError != nil {
+		return "", f.EncryptError
+	}
+	// Simple fake: base64 encode with prefix to identify as fake
+	return "FAKE_TLOCK:" + base64.StdEncoding.EncodeToString(dek), nil
+}
+
+func (f *FakeTimelockBox) Decrypt(ciphertextB64 string) ([]byte, error) {
+	if f.DecryptError != nil {
+		return nil, f.DecryptError
+	}
+	if f.DecryptedDEK != nil {
+		return f.DecryptedDEK, nil
+	}
+	// Reverse the fake encoding
+	if strings.HasPrefix(ciphertextB64, "FAKE_TLOCK:") {
+		return base64.StdEncoding.DecodeString(strings.TrimPrefix(ciphertextB64, "FAKE_TLOCK:"))
+	}
+	// For backwards compatibility with real tlock ciphertext, return error
+	return nil, io.ErrUnexpectedEOF
+}
+
+// newTestDrandAuthority creates a DrandAuthority with fake HTTP and tlock for testing.
+func newTestDrandAuthority(currentRound uint64) *DrandAuthority {
+	fakeHTTP := &FakeHTTPDoer{
+		Responses: map[string]*http.Response{
+			"/info":           makeDrandInfoResponse(),
+			"/public/latest":  makeDrandPublicResponse(currentRound),
+		},
+	}
+
+	return NewDrandAuthorityWithDeps(fakeHTTP, &FakeTimelockBox{})
+}
+
+// newTestDrandAuthorityWithRoundResponses creates a DrandAuthority with specific round responses.
+func newTestDrandAuthorityWithRoundResponses(currentRound uint64, roundResponses map[uint64]*http.Response) *DrandAuthority {
+	fakeHTTP := &FakeHTTPDoer{
+		Responses: map[string]*http.Response{
+			"/info":          makeDrandInfoResponse(),
+			"/public/latest": makeDrandPublicResponse(currentRound),
+		},
+	}
+	// Add round-specific responses
+	for round, resp := range roundResponses {
+		fakeHTTP.Responses["/public/"+string(rune(round))] = resp
+	}
+
+	return NewDrandAuthorityWithDeps(fakeHTTP, &FakeTimelockBox{})
+}
 
 func TestParseUnlockTime_ValidUTC(t *testing.T) {
 	future := time.Now().UTC().Add(24 * time.Hour)
@@ -1051,9 +1187,9 @@ func TestMetadata_IncludesCryptoFields(t *testing.T) {
 }
 
 func TestLockCommand_OutputContract_Success(t *testing.T) {
-	// Build the binary for testing
+	// Build the binary for testing with testmode (uses mock drand)
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}
@@ -1075,12 +1211,7 @@ func TestLockCommand_OutputContract_Success(t *testing.T) {
 
 	err := cmd.Run()
 	if err != nil {
-		// Skip if drand network is unavailable (drand is now the default)
-		stderrStr := stderr.String()
-		if strings.Contains(stderrStr, "drand") || strings.Contains(stderrStr, "tls:") {
-			t.Skipf("skipping test due to network error (drand unavailable): %s", stderrStr)
-		}
-		t.Fatalf("seal lock failed: %v\nstderr: %s\nstdout: %s", err, stderrStr, stdout.String())
+		t.Fatalf("seal lock failed: %v\nstderr: %s\nstdout: %s", err, stderr.String(), stdout.String())
 	}
 
 	// Verify stdout contains only the ID
@@ -1114,9 +1245,9 @@ func TestLockCommand_OutputContract_Success(t *testing.T) {
 }
 
 func TestLockCommand_OutputContract_Error(t *testing.T) {
-	// Build the binary for testing
+	// Build the binary for testing with testmode
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}
@@ -1184,7 +1315,7 @@ func TestLockCommand_OutputContract_NoExtraOutput(t *testing.T) {
 	// This test ensures there are no warnings, informational messages,
 	// or any other output on success
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}
@@ -1206,12 +1337,7 @@ func TestLockCommand_OutputContract_NoExtraOutput(t *testing.T) {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		// Skip if drand network is unavailable (drand is now the default)
-		stderrStr := stderr.String()
-		if strings.Contains(stderrStr, "drand") || strings.Contains(stderrStr, "tls:") {
-			t.Skipf("skipping test due to network error (drand unavailable): %s", stderrStr)
-		}
-		t.Fatalf("seal lock failed: %v\nstderr: %s", err, stderrStr)
+		t.Fatalf("seal lock failed: %v\nstderr: %s", err, stderr.String())
 	}
 
 	stdoutStr := stdout.String()
@@ -1285,7 +1411,7 @@ func TestShredFile_HandlesErrors(t *testing.T) {
 
 func TestLockCommand_Shred_Success(t *testing.T) {
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}
@@ -1312,12 +1438,7 @@ func TestLockCommand_Shred_Success(t *testing.T) {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		// Skip if drand network is unavailable (drand is now the default)
-		stderrStr := stderr.String()
-		if strings.Contains(stderrStr, "drand") || strings.Contains(stderrStr, "tls:") {
-			t.Skipf("skipping test due to network error (drand unavailable): %s", stderrStr)
-		}
-		t.Fatalf("seal lock failed: %v\nstderr: %s", err, stderrStr)
+		t.Fatalf("seal lock failed: %v\nstderr: %s", err, stderr.String())
 	}
 
 	// Stdout should contain only ID
@@ -1342,7 +1463,7 @@ func TestLockCommand_Shred_Success(t *testing.T) {
 
 func TestLockCommand_Shred_FailureDoesNotAbortSealing(t *testing.T) {
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}
@@ -1370,12 +1491,7 @@ func TestLockCommand_Shred_FailureDoesNotAbortSealing(t *testing.T) {
 
 	// Should succeed despite shredding failure
 	if err := cmd.Run(); err != nil {
-		// Skip if drand network is unavailable (drand is now the default)
-		stderrStr := stderr.String()
-		if strings.Contains(stderrStr, "drand") || strings.Contains(stderrStr, "tls:") {
-			t.Skipf("skipping test due to network error (drand unavailable): %s", stderrStr)
-		}
-		t.Fatalf("seal lock should succeed even if shredding fails: %v\nstderr: %s", err, stderrStr)
+		t.Fatalf("seal lock should succeed even if shredding fails: %v\nstderr: %s", err, stderr.String())
 	}
 
 	// Stdout should still contain the sealed item ID
@@ -1403,7 +1519,7 @@ func TestLockCommand_Shred_FailureDoesNotAbortSealing(t *testing.T) {
 
 func TestLockCommand_Shred_ErrorWithStdin(t *testing.T) {
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}
@@ -1439,7 +1555,7 @@ func TestLockCommand_Shred_ErrorWithStdin(t *testing.T) {
 
 func TestLockCommand_Shred_WarningNotSuppressible(t *testing.T) {
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}
@@ -1460,12 +1576,7 @@ func TestLockCommand_Shred_WarningNotSuppressible(t *testing.T) {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		// Skip if drand network is unavailable (drand is now the default)
-		stderrStr := stderr.String()
-		if strings.Contains(stderrStr, "drand") || strings.Contains(stderrStr, "tls:") {
-			t.Skipf("skipping test due to network error (drand unavailable): %s", stderrStr)
-		}
-		t.Fatalf("seal lock failed: %v\nstderr: %s", err, stderrStr)
+		t.Fatalf("seal lock failed: %v\nstderr: %s", err, stderr.String())
 	}
 
 	stderrStr := stderr.String()
@@ -1504,7 +1615,7 @@ func TestClearClipboard_BestEffort(t *testing.T) {
 
 func TestLockCommand_ClearClipboard_Success(t *testing.T) {
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}
@@ -1521,12 +1632,7 @@ func TestLockCommand_ClearClipboard_Success(t *testing.T) {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		// Skip if drand network is unavailable (drand is now the default)
-		stderrStr := stderr.String()
-		if strings.Contains(stderrStr, "drand") || strings.Contains(stderrStr, "tls:") {
-			t.Skipf("skipping test due to network error (drand unavailable): %s", stderrStr)
-		}
-		t.Fatalf("seal lock failed: %v\nstderr: %s", err, stderrStr)
+		t.Fatalf("seal lock failed: %v\nstderr: %s", err, stderr.String())
 	}
 
 	// Stdout should contain only ID
@@ -1547,7 +1653,7 @@ func TestLockCommand_ClearClipboard_Success(t *testing.T) {
 
 func TestLockCommand_ClearClipboard_ErrorWithFile(t *testing.T) {
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}
@@ -1587,7 +1693,7 @@ func TestLockCommand_ClearClipboard_ErrorWithFile(t *testing.T) {
 
 func TestLockCommand_ClearClipboard_WarningNotSuppressible(t *testing.T) {
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}
@@ -1604,12 +1710,7 @@ func TestLockCommand_ClearClipboard_WarningNotSuppressible(t *testing.T) {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		// Skip if drand network is unavailable (drand is now the default)
-		stderrStr := stderr.String()
-		if strings.Contains(stderrStr, "drand") || strings.Contains(stderrStr, "tls:") {
-			t.Skipf("skipping test due to network error (drand unavailable): %s", stderrStr)
-		}
-		t.Fatalf("seal lock failed: %v\nstderr: %s", err, stderrStr)
+		t.Fatalf("seal lock failed: %v\nstderr: %s", err, stderr.String())
 	}
 
 	stderrStr := stderr.String()
@@ -1629,7 +1730,7 @@ func TestLockCommand_ClearClipboard_WarningNotSuppressible(t *testing.T) {
 
 func TestLockCommand_ClearClipboard_FailureDoesNotAbortSealing(t *testing.T) {
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}
@@ -1648,12 +1749,7 @@ func TestLockCommand_ClearClipboard_FailureDoesNotAbortSealing(t *testing.T) {
 
 	// Should succeed even if clipboard clearing fails
 	if err := cmd.Run(); err != nil {
-		// Skip if drand network is unavailable (drand is now the default)
-		stderrStr := stderr.String()
-		if strings.Contains(stderrStr, "drand") || strings.Contains(stderrStr, "tls:") {
-			t.Skipf("skipping test due to network error (drand unavailable): %s", stderrStr)
-		}
-		t.Fatalf("seal lock should succeed even if clipboard clearing fails: %v\nstderr: %s", err, stderrStr)
+		t.Fatalf("seal lock should succeed even if clipboard clearing fails: %v\nstderr: %s", err, stderr.String())
 	}
 
 	// Stdout should still contain the sealed item ID
@@ -1915,7 +2011,7 @@ func TestCheckAndTransitionUnlock_Inert(t *testing.T) {
 }
 
 func TestDrandAuthority_Name(t *testing.T) {
-	authority := NewDrandAuthority()
+	authority := newTestDrandAuthority(1000)
 	
 	if authority.Name() != "drand" {
 		t.Errorf("expected name 'drand', got %s", authority.Name())
@@ -1924,17 +2020,14 @@ func TestDrandAuthority_Name(t *testing.T) {
 
 func TestDrandAuthority_KeyReference_Structure(t *testing.T) {
 	// Test that Lock produces a valid DrandKeyReference structure
-	authority := NewDrandAuthority()
+	authority := newTestDrandAuthority(1000)
 	
-	// Use a future time for testing (doesn't make actual network call in Lock yet)
+	// Use a future time for testing
 	unlockTime := time.Now().UTC().Add(24 * time.Hour)
 	
-	// Note: This will make a network call to get drand info
-	// We'll accept this for now as it's needed to compute the target round
 	ref, err := authority.Lock(unlockTime)
 	if err != nil {
-		// If network is unavailable, skip this test
-		t.Skipf("skipping test due to network error: %v", err)
+		t.Fatalf("Lock failed: %v", err)
 	}
 
 	// Parse the reference
@@ -1958,55 +2051,71 @@ func TestDrandAuthority_KeyReference_Structure(t *testing.T) {
 }
 
 func TestDrandAuthority_CanUnlock_Logic(t *testing.T) {
-	// Test CanUnlock with manually crafted references
-	authority := NewDrandAuthority()
-	
 	testCases := []struct {
-		name        string
-		ref         DrandKeyReference
-		shouldError bool
+		name         string
+		ref          DrandKeyReference
+		currentRound uint64
+		shouldError  bool
+		canUnlock    bool
 	}{
 		{
-			name: "valid reference",
+			name: "valid reference, round reached",
 			ref: DrandKeyReference{
 				Network:     "quicknet",
-				TargetRound: 1000000,
+				TargetRound: 1000,
 			},
-			shouldError: false,
+			currentRound: 1500,
+			shouldError:  false,
+			canUnlock:    true,
+		},
+		{
+			name: "valid reference, round not reached",
+			ref: DrandKeyReference{
+				Network:     "quicknet",
+				TargetRound: 2000,
+			},
+			currentRound: 1500,
+			shouldError:  false,
+			canUnlock:    false,
 		},
 		{
 			name: "wrong network",
 			ref: DrandKeyReference{
 				Network:     "wrong-network",
-				TargetRound: 1000000,
+				TargetRound: 1000,
 			},
-			shouldError: true,
+			currentRound: 1500,
+			shouldError:  true,
+			canUnlock:    false,
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			authority := newTestDrandAuthority(tc.currentRound)
+			
 			refJSON, _ := json.Marshal(tc.ref)
 			keyRef := KeyReference(refJSON)
 			
-			_, err := authority.CanUnlock(keyRef, time.Now())
+			canUnlock, err := authority.CanUnlock(keyRef, time.Now())
 			
 			if tc.shouldError && err == nil {
 				t.Error("expected error, got nil")
 			}
 			
 			if !tc.shouldError && err != nil {
-				// Network errors are acceptable in tests
-				if !strings.Contains(err.Error(), "failed to fetch") {
-					t.Errorf("unexpected error: %v", err)
-				}
+				t.Errorf("unexpected error: %v", err)
+			}
+
+			if !tc.shouldError && canUnlock != tc.canUnlock {
+				t.Errorf("expected canUnlock=%v, got %v", tc.canUnlock, canUnlock)
 			}
 		})
 	}
 }
 
 func TestDrandAuthority_InvalidKeyReference(t *testing.T) {
-	authority := NewDrandAuthority()
+	authority := newTestDrandAuthority(1000)
 	
 	// Invalid JSON
 	invalidRef := KeyReference("not-valid-json")
@@ -2026,14 +2135,20 @@ func TestDrandAuthority_InvalidKeyReference(t *testing.T) {
 }
 
 func TestDrandAuthority_NetworkFailure_DoesNotUnlock(t *testing.T) {
-	// Test with invalid base URL to simulate network failure
-	authority := &DrandAuthority{
-		NetworkName: "test-network",
-		BaseURL:     "http://invalid.example.com/nonexistent",
+	// Test with HTTP client that returns errors
+	fakeHTTP := &FakeHTTPDoer{
+		Errors: map[string]error{
+			"/public/latest": io.ErrUnexpectedEOF,
+		},
+		Responses: map[string]*http.Response{
+			"/info": makeDrandInfoResponse(),
+		},
 	}
 	
+	authority := NewDrandAuthorityWithDeps(fakeHTTP, &FakeTimelockBox{})
+	
 	ref := DrandKeyReference{
-		Network:     "test-network",
+		Network:     "quicknet",
 		TargetRound: 1000,
 	}
 	
@@ -2083,14 +2198,14 @@ func TestDrandKeyReference_Serialization(t *testing.T) {
 
 func TestDrandAuthority_RoundCalculation(t *testing.T) {
 	// Test the round calculation logic with known values
-	// drand quicknet has 3 second period, genesis at specific time
+	// Our fake drand has period=3 and genesis_time=1677685200
 	
-	authority := NewDrandAuthority()
+	authority := newTestDrandAuthority(1000)
 	
-	// Get info to understand the network
+	// Get info from our fake
 	info, err := authority.fetchInfo()
 	if err != nil {
-		t.Skipf("skipping test due to network error: %v", err)
+		t.Fatalf("fetchInfo failed: %v", err)
 	}
 
 	// Create a time based on genesis + known rounds
@@ -2133,11 +2248,11 @@ func TestCreateSealedItem_WithDrandAuthority(t *testing.T) {
 
 	unlockTime := time.Now().UTC().Add(24 * time.Hour)
 	plaintext := []byte("test data with drand")
-	authority := NewDrandAuthority()
+	authority := newTestDrandAuthority(1000)
 
 	id, err := createSealedItem(unlockTime, inputSourceStdin, "", plaintext, authority)
 	if err != nil {
-		t.Skipf("skipping test due to error (likely network): %v", err)
+		t.Fatalf("createSealedItem failed: %v", err)
 	}
 
 	// Read back metadata
@@ -2182,10 +2297,9 @@ func TestCreateSealedItem_WithDrandAuthority(t *testing.T) {
 		t.Error("dek_tlock_b64 should not be empty for drand authority")
 	}
 
-	// Verify tlock ciphertext is valid base64
-	_, err = base64.StdEncoding.DecodeString(meta.DEKTlockB64)
-	if err != nil {
-		t.Fatalf("dek_tlock_b64 should be valid base64: %v", err)
+	// Verify it's a fake tlock ciphertext (from FakeTimelockBox)
+	if !strings.HasPrefix(meta.DEKTlockB64, "FAKE_TLOCK:") {
+		t.Errorf("expected fake tlock prefix, got: %s", meta.DEKTlockB64[:20])
 	}
 
 	// Verify dek.bin does NOT exist (security fix)
@@ -2209,11 +2323,11 @@ func TestCreateSealedItem_DrandAuthority_UsesTlock(t *testing.T) {
 
 	unlockTime := time.Now().UTC().Add(24 * time.Hour)
 	plaintext := []byte("test data")
-	authority := NewDrandAuthority()
+	authority := newTestDrandAuthority(1000)
 
 	id, err := createSealedItem(unlockTime, inputSourceStdin, "", plaintext, authority)
 	if err != nil {
-		t.Skipf("skipping due to error (likely network): %v", err)
+		t.Fatalf("createSealedItem failed: %v", err)
 	}
 
 	// Read metadata
@@ -2234,10 +2348,9 @@ func TestCreateSealedItem_DrandAuthority_UsesTlock(t *testing.T) {
 		t.Error("dek_tlock_b64 should not be empty for drand authority")
 	}
 
-	// Verify tlock ciphertext is valid base64
-	_, err = base64.StdEncoding.DecodeString(meta.DEKTlockB64)
-	if err != nil {
-		t.Fatalf("dek_tlock_b64 should be valid base64: %v", err)
+	// Verify it's a fake tlock ciphertext (from FakeTimelockBox)
+	if !strings.HasPrefix(meta.DEKTlockB64, "FAKE_TLOCK:") {
+		t.Errorf("expected fake tlock prefix, got: %s", meta.DEKTlockB64[:20])
 	}
 
 	// Verify dek.bin does NOT exist (security fix)
@@ -2288,7 +2401,7 @@ func TestMaterialize_AlreadyUnlocked_NoOp(t *testing.T) {
 		TimeAuthority: "drand",
 	}
 
-	authority := NewDrandAuthority()
+	authority := newTestDrandAuthority(1000)
 
 	result, err := tryMaterialize(item, itemDir, authority)
 	if err != nil {
@@ -2302,9 +2415,9 @@ func TestMaterialize_AlreadyUnlocked_NoOp(t *testing.T) {
 }
 
 func TestLockCommand_DefaultsToDrandAuthority(t *testing.T) {
-	// Build the binary for testing
+	// Build the binary for testing with testmode
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}
@@ -2322,10 +2435,6 @@ func TestLockCommand_DefaultsToDrandAuthority(t *testing.T) {
 
 	err := cmd.Run()
 	if err != nil {
-		// Network errors are acceptable - skip if drand is unreachable
-		if strings.Contains(stderr.String(), "drand") || strings.Contains(stderr.String(), "network") {
-			t.Skipf("skipping test due to network error: %s", stderr.String())
-		}
 		t.Fatalf("seal lock failed: %v\nstderr: %s\nstdout: %s", err, stderr.String(), stdout.String())
 	}
 
@@ -2365,6 +2474,11 @@ func TestLockCommand_DefaultsToDrandAuthority(t *testing.T) {
 	// Verify tlock-encrypted DEK exists (drand-specific)
 	if meta.DEKTlockB64 == "" {
 		t.Error("dek_tlock_b64 should not be empty for drand authority")
+	}
+
+	// Verify it's a testmode tlock ciphertext (from testModeTimelockBox)
+	if !strings.HasPrefix(meta.DEKTlockB64, "TESTMODE_TLOCK:") {
+		t.Errorf("expected testmode tlock prefix, got: %s", meta.DEKTlockB64[:20])
 	}
 
 	// Verify key_ref is valid drand reference JSON
