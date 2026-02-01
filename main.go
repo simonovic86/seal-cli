@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -71,6 +72,159 @@ func (p *PlaceholderAuthority) Lock(unlockTime time.Time) (KeyReference, error) 
 func (p *PlaceholderAuthority) CanUnlock(ref KeyReference, now time.Time) (bool, error) {
 	// Always returns false - no unlocking permitted
 	return false, nil
+}
+
+// DrandKeyReference contains drand-specific information for time-locked keys.
+type DrandKeyReference struct {
+	Network     string `json:"network"`
+	TargetRound uint64 `json:"target_round"`
+}
+
+// DrandAuthority is a time authority based on the drand public randomness beacon.
+type DrandAuthority struct {
+	NetworkName string
+	BaseURL     string
+	info        *drandInfo // cached network info
+}
+
+type drandInfo struct {
+	Period          int    `json:"period"`
+	GenesisTime     int64  `json:"genesis_time"`
+	Hash            string `json:"hash"`
+	GroupHash       string `json:"groupHash"`
+	SchemeID        string `json:"schemeID"`
+	BeaconID        string `json:"beaconID"`
+}
+
+type drandPublicResponse struct {
+	Round uint64 `json:"round"`
+}
+
+func (d *DrandAuthority) Name() string {
+	return "drand"
+}
+
+func (d *DrandAuthority) Lock(unlockTime time.Time) (KeyReference, error) {
+	// Fetch network info to get period and genesis time
+	info, err := d.fetchInfo()
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch drand info: %w", err)
+	}
+
+	// Calculate target round for the unlock time
+	// Round number = (unix_time - genesis_time) / period
+	unlockUnix := unlockTime.Unix()
+	elapsedSeconds := unlockUnix - info.GenesisTime
+	
+	if elapsedSeconds < 0 {
+		return "", errors.New("unlock time is before drand genesis")
+	}
+
+	targetRound := uint64(elapsedSeconds) / uint64(info.Period)
+	
+	// Round up to ensure we're at or after the unlock time
+	if uint64(elapsedSeconds)%uint64(info.Period) != 0 {
+		targetRound++
+	}
+
+	// Create key reference
+	ref := DrandKeyReference{
+		Network:     d.NetworkName,
+		TargetRound: targetRound,
+	}
+
+	refJSON, err := json.Marshal(ref)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal key reference: %w", err)
+	}
+
+	return KeyReference(refJSON), nil
+}
+
+func (d *DrandAuthority) CanUnlock(ref KeyReference, now time.Time) (bool, error) {
+	// Parse key reference
+	var drandRef DrandKeyReference
+	if err := json.Unmarshal([]byte(ref), &drandRef); err != nil {
+		return false, fmt.Errorf("invalid drand key reference: %w", err)
+	}
+
+	// Verify network matches
+	if drandRef.Network != d.NetworkName {
+		return false, fmt.Errorf("network mismatch: expected %s, got %s", d.NetworkName, drandRef.Network)
+	}
+
+	// Fetch latest round info
+	currentRound, err := d.fetchLatestRound()
+	if err != nil {
+		return false, fmt.Errorf("failed to fetch latest round: %w", err)
+	}
+
+	// Check if current round has reached or exceeded target round
+	return currentRound >= drandRef.TargetRound, nil
+}
+
+func (d *DrandAuthority) fetchInfo() (*drandInfo, error) {
+	// Return cached info if available
+	if d.info != nil {
+		return d.info, nil
+	}
+
+	url := d.BaseURL + "/info"
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("drand info request failed: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var info drandInfo
+	if err := json.Unmarshal(body, &info); err != nil {
+		return nil, err
+	}
+
+	d.info = &info
+	return &info, nil
+}
+
+func (d *DrandAuthority) fetchLatestRound() (uint64, error) {
+	url := d.BaseURL + "/public/latest"
+	resp, err := http.Get(url)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("drand latest round request failed: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, err
+	}
+
+	var publicResp drandPublicResponse
+	if err := json.Unmarshal(body, &publicResp); err != nil {
+		return 0, err
+	}
+
+	return publicResp.Round, nil
+}
+
+// NewDrandAuthority creates a drand authority for the quicknet network.
+func NewDrandAuthority() *DrandAuthority {
+	return &DrandAuthority{
+		NetworkName: "quicknet",
+		BaseURL:     "https://api.drand.sh/52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971",
+	}
 }
 
 // SealedItem represents metadata for a sealed item.
@@ -614,7 +768,8 @@ func handleLock(args []string) {
 		fmt.Fprintln(os.Stderr, "warning: clipboard clearing is best-effort; the OS or other apps may retain copies")
 	}
 
-	// Create time authority
+	// Create time authority (default: placeholder)
+	// TODO: add CLI flag to select between PlaceholderAuthority and DrandAuthority
 	authority := &PlaceholderAuthority{}
 
 	// Create sealed item with encrypted payload

@@ -1857,3 +1857,267 @@ func TestCheckAndTransitionUnlock_Inert(t *testing.T) {
 		t.Errorf("state should remain unlocked, got %s", result.State)
 	}
 }
+
+func TestDrandAuthority_Name(t *testing.T) {
+	authority := NewDrandAuthority()
+	
+	if authority.Name() != "drand" {
+		t.Errorf("expected name 'drand', got %s", authority.Name())
+	}
+}
+
+func TestDrandAuthority_KeyReference_Structure(t *testing.T) {
+	// Test that Lock produces a valid DrandKeyReference structure
+	authority := NewDrandAuthority()
+	
+	// Use a future time for testing (doesn't make actual network call in Lock yet)
+	unlockTime := time.Now().UTC().Add(24 * time.Hour)
+	
+	// Note: This will make a network call to get drand info
+	// We'll accept this for now as it's needed to compute the target round
+	ref, err := authority.Lock(unlockTime)
+	if err != nil {
+		// If network is unavailable, skip this test
+		t.Skipf("skipping test due to network error: %v", err)
+	}
+
+	// Parse the reference
+	var drandRef DrandKeyReference
+	if err := json.Unmarshal([]byte(ref), &drandRef); err != nil {
+		t.Fatalf("key reference should be valid JSON: %v", err)
+	}
+
+	// Verify structure
+	if drandRef.Network == "" {
+		t.Error("network should not be empty")
+	}
+
+	if drandRef.TargetRound == 0 {
+		t.Error("target round should not be zero")
+	}
+
+	if drandRef.Network != "quicknet" {
+		t.Errorf("expected network 'quicknet', got %s", drandRef.Network)
+	}
+}
+
+func TestDrandAuthority_CanUnlock_Logic(t *testing.T) {
+	// Test CanUnlock with manually crafted references
+	authority := NewDrandAuthority()
+	
+	testCases := []struct {
+		name        string
+		ref         DrandKeyReference
+		shouldError bool
+	}{
+		{
+			name: "valid reference",
+			ref: DrandKeyReference{
+				Network:     "quicknet",
+				TargetRound: 1000000,
+			},
+			shouldError: false,
+		},
+		{
+			name: "wrong network",
+			ref: DrandKeyReference{
+				Network:     "wrong-network",
+				TargetRound: 1000000,
+			},
+			shouldError: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			refJSON, _ := json.Marshal(tc.ref)
+			keyRef := KeyReference(refJSON)
+			
+			_, err := authority.CanUnlock(keyRef, time.Now())
+			
+			if tc.shouldError && err == nil {
+				t.Error("expected error, got nil")
+			}
+			
+			if !tc.shouldError && err != nil {
+				// Network errors are acceptable in tests
+				if !strings.Contains(err.Error(), "failed to fetch") {
+					t.Errorf("unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestDrandAuthority_InvalidKeyReference(t *testing.T) {
+	authority := NewDrandAuthority()
+	
+	// Invalid JSON
+	invalidRef := KeyReference("not-valid-json")
+	
+	canUnlock, err := authority.CanUnlock(invalidRef, time.Now())
+	if err == nil {
+		t.Error("expected error for invalid key reference")
+	}
+	
+	if canUnlock {
+		t.Error("should not be able to unlock with invalid reference")
+	}
+	
+	if !strings.Contains(err.Error(), "invalid drand key reference") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestDrandAuthority_NetworkFailure_DoesNotUnlock(t *testing.T) {
+	// Test with invalid base URL to simulate network failure
+	authority := &DrandAuthority{
+		NetworkName: "test-network",
+		BaseURL:     "http://invalid.example.com/nonexistent",
+	}
+	
+	ref := DrandKeyReference{
+		Network:     "test-network",
+		TargetRound: 1000,
+	}
+	
+	refJSON, _ := json.Marshal(ref)
+	keyRef := KeyReference(refJSON)
+	
+	canUnlock, err := authority.CanUnlock(keyRef, time.Now())
+	
+	// Network failure should return error
+	if err == nil {
+		t.Error("expected error on network failure")
+	}
+	
+	// Should NOT unlock on network failure
+	if canUnlock {
+		t.Error("should not unlock on network failure")
+	}
+}
+
+func TestDrandKeyReference_Serialization(t *testing.T) {
+	ref := DrandKeyReference{
+		Network:     "quicknet",
+		TargetRound: 12345678,
+	}
+
+	// Marshal to JSON
+	jsonData, err := json.Marshal(ref)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+
+	// Unmarshal back
+	var decoded DrandKeyReference
+	if err := json.Unmarshal(jsonData, &decoded); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+
+	// Verify fields
+	if decoded.Network != ref.Network {
+		t.Errorf("Network mismatch: got %s, want %s", decoded.Network, ref.Network)
+	}
+
+	if decoded.TargetRound != ref.TargetRound {
+		t.Errorf("TargetRound mismatch: got %d, want %d", decoded.TargetRound, ref.TargetRound)
+	}
+}
+
+func TestDrandAuthority_RoundCalculation(t *testing.T) {
+	// Test the round calculation logic with known values
+	// drand quicknet has 3 second period, genesis at specific time
+	
+	authority := NewDrandAuthority()
+	
+	// Get info to understand the network
+	info, err := authority.fetchInfo()
+	if err != nil {
+		t.Skipf("skipping test due to network error: %v", err)
+	}
+
+	// Create a time based on genesis + known rounds
+	// Round N starts at: genesis_time + (N * period)
+	testRound := uint64(1000)
+	testTime := time.Unix(info.GenesisTime+int64(testRound)*int64(info.Period), 0)
+	
+	ref, err := authority.Lock(testTime)
+	if err != nil {
+		t.Fatalf("Lock failed: %v", err)
+	}
+
+	var drandRef DrandKeyReference
+	if err := json.Unmarshal([]byte(ref), &drandRef); err != nil {
+		t.Fatalf("failed to parse reference: %v", err)
+	}
+
+	// Target round should be at or slightly after testRound
+	// (due to rounding up to ensure unlock time is reached)
+	if drandRef.TargetRound < testRound {
+		t.Errorf("target round should be >= %d, got %d", testRound, drandRef.TargetRound)
+	}
+
+	if drandRef.TargetRound > testRound+1 {
+		t.Errorf("target round should be close to %d, got %d", testRound, drandRef.TargetRound)
+	}
+}
+
+func TestCreateSealedItem_WithDrandAuthority(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldHome := os.Getenv("HOME")
+	oldXDGDataHome := os.Getenv("XDG_DATA_HOME")
+	defer func() {
+		os.Setenv("HOME", oldHome)
+		os.Setenv("XDG_DATA_HOME", oldXDGDataHome)
+	}()
+
+	os.Setenv("HOME", tmpDir)
+	os.Setenv("XDG_DATA_HOME", "")
+
+	unlockTime := time.Now().UTC().Add(24 * time.Hour)
+	plaintext := []byte("test data with drand")
+	authority := NewDrandAuthority()
+
+	id, err := createSealedItem(unlockTime, inputSourceStdin, "", plaintext, authority)
+	if err != nil {
+		t.Skipf("skipping test due to error (likely network): %v", err)
+	}
+
+	// Read back metadata
+	baseDir, _ := getSealBaseDir()
+	metaPath := filepath.Join(baseDir, id, "meta.json")
+	metaData, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("failed to read metadata: %v", err)
+	}
+
+	var meta SealedItem
+	if err := json.Unmarshal(metaData, &meta); err != nil {
+		t.Fatalf("failed to unmarshal metadata: %v", err)
+	}
+
+	// Verify drand authority metadata
+	if meta.TimeAuthority != "drand" {
+		t.Errorf("expected time_authority 'drand', got %s", meta.TimeAuthority)
+	}
+
+	// Verify key_ref is valid JSON
+	var drandRef DrandKeyReference
+	if err := json.Unmarshal([]byte(meta.KeyRef), &drandRef); err != nil {
+		t.Fatalf("key_ref should be valid DrandKeyReference JSON: %v", err)
+	}
+
+	if drandRef.Network != "quicknet" {
+		t.Errorf("expected network 'quicknet', got %s", drandRef.Network)
+	}
+
+	if drandRef.TargetRound == 0 {
+		t.Error("target round should not be zero")
+	}
+
+	// Verify state is sealed
+	if meta.State != "sealed" {
+		t.Errorf("expected state 'sealed', got %s", meta.State)
+	}
+}
