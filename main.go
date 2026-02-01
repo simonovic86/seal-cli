@@ -964,9 +964,8 @@ func handleLock(args []string) {
 		fmt.Fprintln(os.Stderr, "warning: clipboard clearing is best-effort; the OS or other apps may retain copies")
 	}
 
-	// Create time authority (default: placeholder)
-	// TODO: add CLI flag to select between PlaceholderAuthority and DrandAuthority
-	authority := &PlaceholderAuthority{}
+	// Create time authority (default: drand quicknet)
+	authority := NewDrandAuthority()
 
 	// Create sealed item with encrypted payload
 	id, err := createSealedItem(unlockTime, inputSrc, inputPath, inputData, authority)
