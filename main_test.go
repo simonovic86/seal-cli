@@ -7,7 +7,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -1017,5 +1019,185 @@ func TestMetadata_IncludesCryptoFields(t *testing.T) {
 
 	if decoded.KeyRef != "placeholder" {
 		t.Errorf("KeyRef mismatch: got %s, want placeholder", decoded.KeyRef)
+	}
+}
+
+func TestLockCommand_OutputContract_Success(t *testing.T) {
+	// Build the binary for testing
+	binPath := filepath.Join(t.TempDir(), "seal-test")
+	buildCmd := exec.Command("go", "build", "-o", binPath)
+	if output, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to build binary: %v\n%s", err, output)
+	}
+
+	// Override HOME for isolated test
+	tmpHome := t.TempDir()
+	
+	// Create test input
+	input := "test secret data"
+
+	// Run seal lock command
+	cmd := exec.Command(binPath, "lock", "--until", "2027-12-31T23:59:59Z")
+	cmd.Stdin = strings.NewReader(input)
+	cmd.Env = append(os.Environ(), "HOME="+tmpHome, "XDG_DATA_HOME=")
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("seal lock failed: %v\nstderr: %s\nstdout: %s", err, stderr.String(), stdout.String())
+	}
+
+	// Verify stdout contains only the ID
+	stdoutStr := stdout.String()
+	stderrStr := stderr.String()
+
+	// Stderr must be empty on success
+	if stderrStr != "" {
+		t.Errorf("stderr should be empty on success, got: %q", stderrStr)
+	}
+
+	// Stdout should contain only the ID and optional trailing newline
+	stdoutTrimmed := strings.TrimSpace(stdoutStr)
+	
+	// Verify it's a valid UUID format
+	uuidRegex := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	if !uuidRegex.MatchString(stdoutTrimmed) {
+		t.Errorf("stdout should contain only a UUID, got: %q", stdoutStr)
+	}
+
+	// Verify there's exactly one line (ID + newline)
+	lines := strings.Split(stdoutStr, "\n")
+	if len(lines) != 2 || lines[1] != "" {
+		t.Errorf("stdout should be exactly one line with trailing newline, got %d lines: %q", len(lines), stdoutStr)
+	}
+
+	// Verify no prefixes, suffixes, or labels
+	if stdoutStr != stdoutTrimmed+"\n" {
+		t.Errorf("stdout should be exactly ID + newline, got: %q", stdoutStr)
+	}
+}
+
+func TestLockCommand_OutputContract_Error(t *testing.T) {
+	// Build the binary for testing
+	binPath := filepath.Join(t.TempDir(), "seal-test")
+	buildCmd := exec.Command("go", "build", "-o", binPath)
+	if output, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to build binary: %v\n%s", err, output)
+	}
+
+	testCases := []struct {
+		name     string
+		args     []string
+		stdin    string
+		wantErr  string
+	}{
+		{
+			name:    "missing --until flag",
+			args:    []string{"lock"},
+			stdin:   "test",
+			wantErr: "error: --until is required",
+		},
+		{
+			name:    "invalid time format",
+			args:    []string{"lock", "--until", "invalid"},
+			stdin:   "test",
+			wantErr: "error: invalid time format",
+		},
+		{
+			name:    "past timestamp",
+			args:    []string{"lock", "--until", "2020-01-01T00:00:00Z"},
+			stdin:   "test",
+			wantErr: "error: unlock time must be in the future",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpHome := t.TempDir()
+
+			cmd := exec.Command(binPath, tc.args...)
+			cmd.Stdin = strings.NewReader(tc.stdin)
+			cmd.Env = append(os.Environ(), "HOME="+tmpHome, "XDG_DATA_HOME=")
+
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout = &stdout
+			cmd.Stderr = &stderr
+
+			err := cmd.Run()
+			
+			// Error cases should exit with non-zero
+			if err == nil {
+				t.Fatalf("expected command to fail, but it succeeded\nstdout: %s\nstderr: %s", stdout.String(), stderr.String())
+			}
+
+			// Stdout should be empty on error
+			if stdout.String() != "" {
+				t.Errorf("stdout should be empty on error, got: %q", stdout.String())
+			}
+
+			// Stderr should contain the error message
+			stderrStr := stderr.String()
+			if !strings.Contains(stderrStr, tc.wantErr) {
+				t.Errorf("stderr should contain %q, got: %q", tc.wantErr, stderrStr)
+			}
+		})
+	}
+}
+
+func TestLockCommand_OutputContract_NoExtraOutput(t *testing.T) {
+	// This test ensures there are no warnings, informational messages,
+	// or any other output on success
+	binPath := filepath.Join(t.TempDir(), "seal-test")
+	buildCmd := exec.Command("go", "build", "-o", binPath)
+	if output, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to build binary: %v\n%s", err, output)
+	}
+
+	tmpHome := t.TempDir()
+	
+	// Create a test file
+	testFile := filepath.Join(tmpHome, "test.txt")
+	if err := os.WriteFile(testFile, []byte("file content"), 0600); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	// Test with file input
+	cmd := exec.Command(binPath, "lock", "--until", "2027-06-15T10:00:00Z", testFile)
+	cmd.Env = append(os.Environ(), "HOME="+tmpHome, "XDG_DATA_HOME=")
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("seal lock failed: %v\nstderr: %s", err, stderr.String())
+	}
+
+	stdoutStr := stdout.String()
+	stderrStr := stderr.String()
+
+	// No warnings or informational messages
+	if stderrStr != "" {
+		t.Errorf("no messages should be written to stderr on success, got: %q", stderrStr)
+	}
+
+	// Only ID output
+	stdoutTrimmed := strings.TrimSpace(stdoutStr)
+	uuidRegex := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	if !uuidRegex.MatchString(stdoutTrimmed) {
+		t.Errorf("output should be only UUID, got: %q", stdoutStr)
+	}
+
+	// No labels like "ID:", "Sealed:", etc.
+	if strings.Contains(stdoutStr, ":") {
+		t.Errorf("output should not contain labels or colons, got: %q", stdoutStr)
+	}
+
+	// No multiple IDs or extra lines
+	if strings.Count(stdoutStr, "\n") != 1 {
+		t.Errorf("output should have exactly one newline, got: %q", stdoutStr)
 	}
 }
