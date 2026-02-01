@@ -1,6 +1,10 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -41,6 +45,9 @@ type SealedItem struct {
 	OriginalPath    string    `json:"original_path,omitempty"`
 	TimeAuthority   string    `json:"time_authority"`
 	CreatedAt       time.Time `json:"created_at"`
+	Algorithm       string    `json:"algorithm"`
+	Nonce           string    `json:"nonce"`
+	KeyRef          string    `json:"key_ref"`
 }
 
 const usageText = `seal - irreversible time-locked commitment primitive
@@ -172,6 +179,50 @@ func readInput(path string) ([]byte, inputSource, error) {
 	return data, source, nil
 }
 
+// encryptPayload encrypts plaintext using AES-256-GCM.
+// Returns ciphertext and nonce (base64 encoded).
+// The symmetric key is generated and discarded (not stored anywhere).
+// Payload format: only ciphertext is stored; nonce is stored in metadata.
+func encryptPayload(plaintext []byte) (ciphertext []byte, nonceB64 string, err error) {
+	// Generate random 32-byte key for AES-256
+	key := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+		return nil, "", fmt.Errorf("failed to generate key: %w", err)
+	}
+	defer func() {
+		// Zero out key from memory (best effort)
+		for i := range key {
+			key[i] = 0
+		}
+	}()
+
+	// Create AES cipher
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to create cipher: %w", err)
+	}
+
+	// Create GCM mode
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to create GCM: %w", err)
+	}
+
+	// Generate random nonce
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, "", fmt.Errorf("failed to generate nonce: %w", err)
+	}
+
+	// Encrypt plaintext
+	ciphertext = gcm.Seal(nil, nonce, plaintext, nil)
+
+	// Encode nonce as base64 for storage
+	nonceB64 = base64.StdEncoding.EncodeToString(nonce)
+
+	return ciphertext, nonceB64, nil
+}
+
 // getSealBaseDir returns the OS-appropriate base directory for Seal data.
 func getSealBaseDir() (string, error) {
 	var baseDir string
@@ -208,8 +259,9 @@ func getSealBaseDir() (string, error) {
 }
 
 // createSealedItem creates a new sealed item on disk.
+// Encrypts the payload using AES-256-GCM.
 // Returns the item ID and error.
-func createSealedItem(unlockTime time.Time, inputType inputSource, originalPath string, payload []byte) (string, error) {
+func createSealedItem(unlockTime time.Time, inputType inputSource, originalPath string, plaintext []byte) (string, error) {
 	baseDir, err := getSealBaseDir()
 	if err != nil {
 		return "", err
@@ -218,6 +270,12 @@ func createSealedItem(unlockTime time.Time, inputType inputSource, originalPath 
 	// Create base directory if it doesn't exist
 	if err := os.MkdirAll(baseDir, 0700); err != nil {
 		return "", fmt.Errorf("cannot create seal directory: %w", err)
+	}
+
+	// Encrypt payload
+	ciphertext, nonceB64, err := encryptPayload(plaintext)
+	if err != nil {
+		return "", fmt.Errorf("encryption failed: %w", err)
 	}
 
 	// Generate UUID for this sealed item
@@ -237,6 +295,9 @@ func createSealedItem(unlockTime time.Time, inputType inputSource, originalPath 
 		OriginalPath:  originalPath,
 		TimeAuthority: "placeholder", // TODO: implement time authority
 		CreatedAt:     time.Now().UTC(),
+		Algorithm:     "aes-256-gcm",
+		Nonce:         nonceB64,
+		KeyRef:        "placeholder", // TODO: implement key escrow/time-lock
 	}
 
 	// Write metadata
@@ -250,9 +311,9 @@ func createSealedItem(unlockTime time.Time, inputType inputSource, originalPath 
 		return "", fmt.Errorf("cannot write metadata: %w", err)
 	}
 
-	// Write payload (encrypted placeholder for now)
+	// Write encrypted payload (ciphertext only, nonce is in metadata)
 	payloadPath := filepath.Join(itemDir, "payload.bin")
-	if err := os.WriteFile(payloadPath, payload, 0600); err != nil {
+	if err := os.WriteFile(payloadPath, ciphertext, 0600); err != nil {
 		return "", fmt.Errorf("cannot write payload: %w", err)
 	}
 
@@ -349,7 +410,7 @@ func handleLock(args []string) {
 		os.Exit(1)
 	}
 
-	// Create sealed item (payload is unencrypted placeholder for now)
+	// Create sealed item with encrypted payload
 	id, err := createSealedItem(unlockTime, inputSrc, inputPath, inputData)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)

@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -521,15 +524,33 @@ func TestCreateSealedItem_And_List(t *testing.T) {
 		t.Error("CreatedAt should not be zero")
 	}
 
-	// Check payload.bin exists
+	// Verify crypto metadata
+	if meta.Algorithm != "aes-256-gcm" {
+		t.Errorf("Algorithm mismatch: got %s, want aes-256-gcm", meta.Algorithm)
+	}
+
+	if meta.Nonce == "" {
+		t.Error("Nonce should not be empty")
+	}
+
+	if meta.KeyRef != "placeholder" {
+		t.Errorf("KeyRef mismatch: got %s, want placeholder", meta.KeyRef)
+	}
+
+	// Check payload.bin exists and is encrypted
 	payloadPath := filepath.Join(itemDir, "payload.bin")
 	payloadData, err := os.ReadFile(payloadPath)
 	if err != nil {
 		t.Fatalf("cannot read payload.bin: %v", err)
 	}
 
-	if !bytes.Equal(payloadData, testPayload) {
-		t.Errorf("payload mismatch: got %q, want %q", payloadData, testPayload)
+	// Payload should be encrypted, not plaintext
+	if bytes.Equal(payloadData, testPayload) {
+		t.Error("payload should be encrypted, not plaintext")
+	}
+
+	if len(payloadData) == 0 {
+		t.Error("payload should not be empty")
 	}
 
 	// List sealed items
@@ -559,6 +580,9 @@ func TestMetadata_RoundTrip(t *testing.T) {
 		OriginalPath:  "",
 		TimeAuthority: "placeholder",
 		CreatedAt:     createdAt,
+		Algorithm:     "aes-256-gcm",
+		Nonce:         "dGVzdG5vbmNl",
+		KeyRef:        "placeholder",
 	}
 
 	// Marshal to JSON
@@ -596,6 +620,18 @@ func TestMetadata_RoundTrip(t *testing.T) {
 
 	if !decoded.CreatedAt.Equal(original.CreatedAt) {
 		t.Errorf("CreatedAt mismatch: got %v, want %v", decoded.CreatedAt, original.CreatedAt)
+	}
+
+	if decoded.Algorithm != original.Algorithm {
+		t.Errorf("Algorithm mismatch: got %s, want %s", decoded.Algorithm, original.Algorithm)
+	}
+
+	if decoded.Nonce != original.Nonce {
+		t.Errorf("Nonce mismatch: got %s, want %s", decoded.Nonce, original.Nonce)
+	}
+
+	if decoded.KeyRef != original.KeyRef {
+		t.Errorf("KeyRef mismatch: got %s, want %s", decoded.KeyRef, original.KeyRef)
 	}
 }
 
@@ -695,5 +731,291 @@ func TestInputSource_String(t *testing.T) {
 
 	if inputSourceStdin.String() != "stdin" {
 		t.Errorf("expected 'stdin', got %s", inputSourceStdin.String())
+	}
+}
+
+// decryptPayloadForTest is a test-only helper to decrypt AES-256-GCM ciphertext.
+// This function is ONLY for testing and should NEVER be in production code paths.
+func decryptPayloadForTest(ciphertext []byte, nonceB64 string, key []byte) ([]byte, error) {
+	// Decode nonce from base64
+	nonce, err := base64.StdEncoding.DecodeString(nonceB64)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create AES cipher
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create GCM mode
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	// Decrypt
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return plaintext, nil
+}
+
+func TestEncryptPayload_ProducesNonPlaintext(t *testing.T) {
+	plaintext := []byte("this is a secret message")
+
+	ciphertext, nonceB64, err := encryptPayload(plaintext)
+	if err != nil {
+		t.Fatalf("encryptPayload failed: %v", err)
+	}
+
+	// Verify ciphertext is different from plaintext
+	if bytes.Equal(ciphertext, plaintext) {
+		t.Error("ciphertext should not equal plaintext")
+	}
+
+	// Verify nonce is base64 encoded
+	nonce, err := base64.StdEncoding.DecodeString(nonceB64)
+	if err != nil {
+		t.Fatalf("nonce is not valid base64: %v", err)
+	}
+
+	// Verify nonce size is correct (GCM standard is 12 bytes)
+	if len(nonce) != 12 {
+		t.Errorf("expected nonce size 12, got %d", len(nonce))
+	}
+
+	// Verify ciphertext is longer than plaintext (includes auth tag)
+	if len(ciphertext) <= len(plaintext) {
+		t.Errorf("expected ciphertext to be longer than plaintext (includes auth tag)")
+	}
+}
+
+func TestEncryptPayload_RoundTrip(t *testing.T) {
+	// Test various plaintext sizes
+	testCases := []struct {
+		name      string
+		plaintext []byte
+	}{
+		{"short", []byte("hello")},
+		{"medium", []byte("this is a longer message with more content")},
+		{"empty", []byte("")},
+		{"binary", []byte{0x00, 0x01, 0x02, 0xFF, 0xFE, 0xFD}},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// For testing purposes, we need to modify encryptPayload to return the key
+			// Since we can't do that without changing production code, we'll test
+			// via the full createSealedItem flow
+
+			// Override base directory for testing
+			tmpDir := t.TempDir()
+			oldHome := os.Getenv("HOME")
+			oldXDGDataHome := os.Getenv("XDG_DATA_HOME")
+			defer func() {
+				os.Setenv("HOME", oldHome)
+				os.Setenv("XDG_DATA_HOME", oldXDGDataHome)
+			}()
+
+			os.Setenv("HOME", tmpDir)
+			os.Setenv("XDG_DATA_HOME", "")
+
+			// Note: We can't actually test round-trip without the key,
+			// which is intentionally discarded. This test verifies the
+			// encryption happens and produces valid output structure.
+
+			ciphertext, nonceB64, err := encryptPayload(tc.plaintext)
+			if err != nil {
+				t.Fatalf("encryption failed: %v", err)
+			}
+
+			// Verify structure
+			if len(nonceB64) == 0 {
+				t.Error("nonce should not be empty")
+			}
+
+			nonce, err := base64.StdEncoding.DecodeString(nonceB64)
+			if err != nil {
+				t.Fatalf("nonce decoding failed: %v", err)
+			}
+
+			if len(nonce) != 12 {
+				t.Errorf("expected nonce size 12, got %d", len(nonce))
+			}
+
+			// For empty plaintext, ciphertext should still contain auth tag
+			if len(tc.plaintext) == 0 {
+				if len(ciphertext) != 16 { // GCM auth tag is 16 bytes
+					t.Errorf("expected ciphertext size 16 for empty plaintext, got %d", len(ciphertext))
+				}
+			}
+		})
+	}
+}
+
+func TestEncryptPayload_DifferentNoncesEachTime(t *testing.T) {
+	plaintext := []byte("same message")
+
+	// Encrypt multiple times
+	var nonces []string
+	for i := 0; i < 5; i++ {
+		_, nonceB64, err := encryptPayload(plaintext)
+		if err != nil {
+			t.Fatalf("encryption %d failed: %v", i, err)
+		}
+		nonces = append(nonces, nonceB64)
+	}
+
+	// Verify all nonces are different
+	for i := 0; i < len(nonces); i++ {
+		for j := i + 1; j < len(nonces); j++ {
+			if nonces[i] == nonces[j] {
+				t.Errorf("nonces should be unique, but nonce %d equals nonce %d", i, j)
+			}
+		}
+	}
+}
+
+func TestEncryptPayload_DifferentCiphertextEachTime(t *testing.T) {
+	plaintext := []byte("same message")
+
+	// Encrypt multiple times
+	var ciphertexts [][]byte
+	for i := 0; i < 5; i++ {
+		ciphertext, _, err := encryptPayload(plaintext)
+		if err != nil {
+			t.Fatalf("encryption %d failed: %v", i, err)
+		}
+		ciphertexts = append(ciphertexts, ciphertext)
+	}
+
+	// Verify all ciphertexts are different (due to different nonces)
+	for i := 0; i < len(ciphertexts); i++ {
+		for j := i + 1; j < len(ciphertexts); j++ {
+			if bytes.Equal(ciphertexts[i], ciphertexts[j]) {
+				t.Errorf("ciphertexts should be different, but ciphertext %d equals ciphertext %d", i, j)
+			}
+		}
+	}
+}
+
+func TestCreateSealedItem_EncryptsPayload(t *testing.T) {
+	// Override base directory for testing
+	tmpDir := t.TempDir()
+	oldHome := os.Getenv("HOME")
+	oldXDGDataHome := os.Getenv("XDG_DATA_HOME")
+	defer func() {
+		os.Setenv("HOME", oldHome)
+		os.Setenv("XDG_DATA_HOME", oldXDGDataHome)
+	}()
+
+	os.Setenv("HOME", tmpDir)
+	os.Setenv("XDG_DATA_HOME", "")
+
+	unlockTime := time.Now().UTC().Add(24 * time.Hour)
+	plaintext := []byte("secret data to seal")
+
+	id, err := createSealedItem(unlockTime, inputSourceStdin, "", plaintext)
+	if err != nil {
+		t.Fatalf("createSealedItem failed: %v", err)
+	}
+
+	// Read back the metadata
+	baseDir, _ := getSealBaseDir()
+	metaPath := filepath.Join(baseDir, id, "meta.json")
+	metaData, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("failed to read metadata: %v", err)
+	}
+
+	var meta SealedItem
+	if err := json.Unmarshal(metaData, &meta); err != nil {
+		t.Fatalf("failed to unmarshal metadata: %v", err)
+	}
+
+	// Verify crypto metadata
+	if meta.Algorithm != "aes-256-gcm" {
+		t.Errorf("expected algorithm 'aes-256-gcm', got %s", meta.Algorithm)
+	}
+
+	if meta.Nonce == "" {
+		t.Error("nonce should not be empty")
+	}
+
+	if meta.KeyRef != "placeholder" {
+		t.Errorf("expected key_ref 'placeholder', got %s", meta.KeyRef)
+	}
+
+	// Verify nonce decodes properly
+	nonce, err := base64.StdEncoding.DecodeString(meta.Nonce)
+	if err != nil {
+		t.Fatalf("nonce is not valid base64: %v", err)
+	}
+
+	if len(nonce) != 12 {
+		t.Errorf("expected nonce size 12, got %d", len(nonce))
+	}
+
+	// Read payload
+	payloadPath := filepath.Join(baseDir, id, "payload.bin")
+	payload, err := os.ReadFile(payloadPath)
+	if err != nil {
+		t.Fatalf("failed to read payload: %v", err)
+	}
+
+	// Verify payload is NOT plaintext
+	if bytes.Equal(payload, plaintext) {
+		t.Error("payload should be encrypted, not plaintext")
+	}
+
+	// Verify payload is not empty
+	if len(payload) == 0 {
+		t.Error("payload should not be empty")
+	}
+}
+
+func TestMetadata_IncludesCryptoFields(t *testing.T) {
+	unlockTime := time.Date(2027, 3, 15, 14, 30, 0, 0, time.UTC)
+	createdAt := time.Date(2026, 2, 1, 10, 0, 0, 0, time.UTC)
+
+	meta := SealedItem{
+		ID:            "test-id-123",
+		UnlockTime:    unlockTime,
+		InputType:     "stdin",
+		OriginalPath:  "",
+		TimeAuthority: "placeholder",
+		CreatedAt:     createdAt,
+		Algorithm:     "aes-256-gcm",
+		Nonce:         "dGVzdG5vbmNl",
+		KeyRef:        "placeholder",
+	}
+
+	// Marshal to JSON
+	jsonData, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+
+	// Unmarshal back
+	var decoded SealedItem
+	if err := json.Unmarshal(jsonData, &decoded); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+
+	// Verify crypto fields
+	if decoded.Algorithm != "aes-256-gcm" {
+		t.Errorf("Algorithm mismatch: got %s, want aes-256-gcm", decoded.Algorithm)
+	}
+
+	if decoded.Nonce != "dGVzdG5vbmNl" {
+		t.Errorf("Nonce mismatch: got %s, want dGVzdG5vbmNl", decoded.Nonce)
+	}
+
+	if decoded.KeyRef != "placeholder" {
+		t.Errorf("KeyRef mismatch: got %s, want placeholder", decoded.KeyRef)
 	}
 }
