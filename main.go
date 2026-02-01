@@ -1,10 +1,23 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"time"
+)
+
+const (
+	maxInputSize = 10 * 1024 * 1024 // 10MB
+)
+
+type inputSource int
+
+const (
+	inputSourceFile inputSource = iota
+	inputSourceStdin
 )
 
 const usageText = `seal - irreversible time-locked commitment primitive
@@ -65,6 +78,77 @@ func parseUnlockTime(s string) (time.Time, error) {
 	return t, nil
 }
 
+// readInput reads input from either a file path or stdin.
+// Enforces maximum size limit.
+// Returns data, source type, and error.
+func readInput(path string) ([]byte, inputSource, error) {
+	stdinStat, err := os.Stdin.Stat()
+	if err != nil {
+		return nil, 0, fmt.Errorf("cannot stat stdin: %w", err)
+	}
+
+	stdinHasData := (stdinStat.Mode() & os.ModeCharDevice) == 0
+
+	// Case: both file path and stdin
+	if path != "" && stdinHasData {
+		return nil, 0, errors.New("cannot read from both file and stdin")
+	}
+
+	// Case: neither file path nor stdin
+	if path == "" && !stdinHasData {
+		return nil, 0, errors.New("no input provided (use file path or pipe to stdin)")
+	}
+
+	var data []byte
+	var source inputSource
+
+	if path != "" {
+		// Read from file
+		source = inputSourceFile
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, 0, fmt.Errorf("cannot open file: %w", err)
+		}
+		defer file.Close()
+
+		// Check file size
+		fileInfo, err := file.Stat()
+		if err != nil {
+			return nil, 0, fmt.Errorf("cannot stat file: %w", err)
+		}
+
+		if fileInfo.Size() > maxInputSize {
+			return nil, 0, fmt.Errorf("input exceeds maximum size of %d bytes", maxInputSize)
+		}
+
+		if fileInfo.Size() == 0 {
+			return nil, 0, errors.New("input is empty")
+		}
+
+		data, err = io.ReadAll(io.LimitReader(file, maxInputSize+1))
+		if err != nil {
+			return nil, 0, fmt.Errorf("cannot read file: %w", err)
+		}
+	} else {
+		// Read from stdin
+		source = inputSourceStdin
+		data, err = io.ReadAll(io.LimitReader(os.Stdin, maxInputSize+1))
+		if err != nil {
+			return nil, 0, fmt.Errorf("cannot read stdin: %w", err)
+		}
+
+		if len(data) == 0 {
+			return nil, 0, errors.New("input is empty")
+		}
+
+		if len(data) > maxInputSize {
+			return nil, 0, fmt.Errorf("input exceeds maximum size of %d bytes", maxInputSize)
+		}
+	}
+
+	return data, source, nil
+}
+
 func handleLock(args []string) {
 	lockFlags := flag.NewFlagSet("lock", flag.ExitOnError)
 	until := lockFlags.String("until", "", "RFC3339 timestamp for unlock time")
@@ -89,9 +173,6 @@ func handleLock(args []string) {
 		os.Exit(1)
 	}
 
-	_ = unlockTime // validated but not yet used in stub implementation
-
-	var inputPath string
 	remaining := lockFlags.Args()
 
 	if len(remaining) > 1 {
@@ -100,13 +181,20 @@ func handleLock(args []string) {
 		os.Exit(1)
 	}
 
+	var inputPath string
 	if len(remaining) == 1 {
 		inputPath = remaining[0]
-		if _, err := os.Stat(inputPath); os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "error: file does not exist: %s\n", inputPath)
-			os.Exit(1)
-		}
 	}
+
+	inputData, inputSrc, err := readInput(inputPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	_ = unlockTime // validated but not yet used in stub implementation
+	_ = inputData  // read but not yet encrypted in stub implementation
+	_ = inputSrc   // tracked but not yet used in stub implementation
 
 	fmt.Fprintln(os.Stderr, "error: lock not implemented")
 	os.Exit(1)

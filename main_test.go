@@ -1,6 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -166,5 +170,246 @@ func TestParseUnlockTime_NormalizesToUTC(t *testing.T) {
 				t.Errorf("times not equal: %v != %v", results[0], results[i])
 			}
 		}
+	}
+}
+
+func TestReadInput_FileValid(t *testing.T) {
+	// Create temporary test file
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "test.txt")
+	testContent := []byte("test content for sealing")
+
+	err := os.WriteFile(testFile, testContent, 0600)
+	if err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	data, source, err := readInput(testFile)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if source != inputSourceFile {
+		t.Errorf("expected source to be inputSourceFile, got: %v", source)
+	}
+
+	if !bytes.Equal(data, testContent) {
+		t.Errorf("data mismatch: got %q, want %q", data, testContent)
+	}
+}
+
+func TestReadInput_StdinValid(t *testing.T) {
+	// Save original stdin
+	oldStdin := os.Stdin
+	defer func() { os.Stdin = oldStdin }()
+
+	// Create a pipe to simulate stdin
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("failed to create pipe: %v", err)
+	}
+
+	testContent := []byte("stdin test content")
+	go func() {
+		w.Write(testContent)
+		w.Close()
+	}()
+
+	os.Stdin = r
+
+	data, source, err := readInput("")
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if source != inputSourceStdin {
+		t.Errorf("expected source to be inputSourceStdin, got: %v", source)
+	}
+
+	if !bytes.Equal(data, testContent) {
+		t.Errorf("data mismatch: got %q, want %q", data, testContent)
+	}
+}
+
+func TestReadInput_BothFileAndStdin(t *testing.T) {
+	// Save original stdin
+	oldStdin := os.Stdin
+	defer func() { os.Stdin = oldStdin }()
+
+	// Create temporary test file
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "test.txt")
+	err := os.WriteFile(testFile, []byte("file content"), 0600)
+	if err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	// Create a pipe to simulate stdin with data
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("failed to create pipe: %v", err)
+	}
+
+	go func() {
+		w.Write([]byte("stdin content"))
+		w.Close()
+	}()
+
+	os.Stdin = r
+
+	_, _, err = readInput(testFile)
+	if err == nil {
+		t.Fatal("expected error when both file and stdin provided, got nil")
+	}
+
+	if err.Error() != "cannot read from both file and stdin" {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestReadInput_NeitherFileNorStdin(t *testing.T) {
+	// Save original stdin
+	oldStdin := os.Stdin
+	defer func() { os.Stdin = oldStdin }()
+
+	// Create a pipe but don't write anything (simulates terminal stdin)
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("failed to create pipe: %v", err)
+	}
+	w.Close() // Close immediately to simulate no data
+
+	// Use /dev/tty or similar to simulate a character device
+	// For testing, we'll just check the actual error
+	os.Stdin = oldStdin // Use actual stdin (which is typically a character device in tests)
+
+	_, _, err = readInput("")
+	if err == nil {
+		t.Fatal("expected error when neither file nor stdin provided, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "no input provided") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+
+	r.Close()
+}
+
+func TestReadInput_EmptyFile(t *testing.T) {
+	// Create empty temporary test file
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "empty.txt")
+
+	err := os.WriteFile(testFile, []byte{}, 0600)
+	if err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	_, _, err = readInput(testFile)
+	if err == nil {
+		t.Fatal("expected error for empty file, got nil")
+	}
+
+	if err.Error() != "input is empty" {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestReadInput_EmptyStdin(t *testing.T) {
+	// Save original stdin
+	oldStdin := os.Stdin
+	defer func() { os.Stdin = oldStdin }()
+
+	// Create a pipe with no data
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("failed to create pipe: %v", err)
+	}
+
+	// Close write end immediately (empty stdin)
+	w.Close()
+
+	os.Stdin = r
+
+	_, _, err = readInput("")
+	if err == nil {
+		t.Fatal("expected error for empty stdin, got nil")
+	}
+
+	if err.Error() != "input is empty" {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestReadInput_ExceedsMaxSize_File(t *testing.T) {
+	// Create temporary test file that exceeds max size
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "large.txt")
+
+	// Create a file larger than maxInputSize
+	largeContent := make([]byte, maxInputSize+1)
+	for i := range largeContent {
+		largeContent[i] = 'A'
+	}
+
+	err := os.WriteFile(testFile, largeContent, 0600)
+	if err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	_, _, err = readInput(testFile)
+	if err == nil {
+		t.Fatal("expected error for file exceeding size limit, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "exceeds maximum size") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestReadInput_ExceedsMaxSize_Stdin(t *testing.T) {
+	// Save original stdin
+	oldStdin := os.Stdin
+	defer func() { os.Stdin = oldStdin }()
+
+	// Create a pipe with content exceeding max size
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("failed to create pipe: %v", err)
+	}
+
+	largeContent := make([]byte, maxInputSize+1)
+	for i := range largeContent {
+		largeContent[i] = 'B'
+	}
+
+	go func() {
+		w.Write(largeContent)
+		w.Close()
+	}()
+
+	os.Stdin = r
+
+	_, _, err = readInput("")
+	if err == nil {
+		t.Fatal("expected error for stdin exceeding size limit, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "exceeds maximum size") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestReadInput_FileDoesNotExist(t *testing.T) {
+	tmpDir := t.TempDir()
+	nonExistentFile := filepath.Join(tmpDir, "does-not-exist.txt")
+
+	_, _, err := readInput(nonExistentFile)
+	if err == nil {
+		t.Fatal("expected error for non-existent file, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "cannot open file") {
+		t.Errorf("unexpected error message: %v", err)
 	}
 }
