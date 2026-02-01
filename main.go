@@ -4,7 +4,9 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -19,6 +21,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/crypto/hkdf"
 )
 
 const (
@@ -97,7 +100,8 @@ type drandInfo struct {
 }
 
 type drandPublicResponse struct {
-	Round uint64 `json:"round"`
+	Round      uint64 `json:"round"`
+	Randomness string `json:"randomness"`
 }
 
 func (d *DrandAuthority) Name() string {
@@ -219,12 +223,51 @@ func (d *DrandAuthority) fetchLatestRound() (uint64, error) {
 	return publicResp.Round, nil
 }
 
+func (d *DrandAuthority) fetchRoundRandomness(round uint64) ([]byte, error) {
+	url := fmt.Sprintf("%s/public/%d", d.BaseURL, round)
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("drand round %d request failed: %d", round, resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var publicResp drandPublicResponse
+	if err := json.Unmarshal(body, &publicResp); err != nil {
+		return nil, err
+	}
+
+	// Decode hex-encoded randomness
+	randomness, err := hex.DecodeString(publicResp.Randomness)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode randomness: %w", err)
+	}
+
+	return randomness, nil
+}
+
 // NewDrandAuthority creates a drand authority for the quicknet network.
 func NewDrandAuthority() *DrandAuthority {
 	return &DrandAuthority{
 		NetworkName: "quicknet",
 		BaseURL:     "https://api.drand.sh/52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971",
 	}
+}
+
+// DEKWrap contains information for wrapping/unwrapping the Data Encryption Key.
+type DEKWrap struct {
+	Alg        string  `json:"alg"`
+	TargetRound uint64 `json:"target_round"`
+	WrapNonce   *string `json:"wrap_nonce"`
+	WrappedDEK  *string `json:"wrapped_dek"`
 }
 
 // SealedItem represents metadata for a sealed item.
@@ -239,6 +282,7 @@ type SealedItem struct {
 	Algorithm       string    `json:"algorithm"`
 	Nonce           string    `json:"nonce"`
 	KeyRef          string    `json:"key_ref"`
+	DEKWrap         *DEKWrap  `json:"dek_wrap,omitempty"`
 }
 
 const usageText = `seal - irreversible time-locked commitment primitive
@@ -372,39 +416,32 @@ func readInput(path string) ([]byte, inputSource, error) {
 	return data, source, nil
 }
 
-// encryptPayload encrypts plaintext using AES-256-GCM.
-// Returns ciphertext and nonce (base64 encoded).
-// The symmetric key is generated and discarded (not stored anywhere).
-// Payload format: only ciphertext is stored; nonce is stored in metadata.
-func encryptPayload(plaintext []byte) (ciphertext []byte, nonceB64 string, err error) {
-	// Generate random 32-byte key for AES-256
-	key := make([]byte, 32)
-	if _, err := io.ReadFull(rand.Reader, key); err != nil {
-		return nil, "", fmt.Errorf("failed to generate key: %w", err)
+// encryptPayload encrypts plaintext using AES-256-GCM with a fresh DEK.
+// Returns ciphertext, nonce (base64), and the unwrapped DEK.
+// The DEK must be wrapped before storage.
+func encryptPayload(plaintext []byte) (ciphertext []byte, nonceB64 string, dek []byte, err error) {
+	// Generate random 32-byte DEK for AES-256
+	dek = make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, dek); err != nil {
+		return nil, "", nil, fmt.Errorf("failed to generate DEK: %w", err)
 	}
-	defer func() {
-		// Zero out key from memory (best effort)
-		for i := range key {
-			key[i] = 0
-		}
-	}()
 
 	// Create AES cipher
-	block, err := aes.NewCipher(key)
+	block, err := aes.NewCipher(dek)
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to create cipher: %w", err)
+		return nil, "", nil, fmt.Errorf("failed to create cipher: %w", err)
 	}
 
 	// Create GCM mode
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to create GCM: %w", err)
+		return nil, "", nil, fmt.Errorf("failed to create GCM: %w", err)
 	}
 
 	// Generate random nonce
 	nonce := make([]byte, gcm.NonceSize())
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return nil, "", fmt.Errorf("failed to generate nonce: %w", err)
+		return nil, "", nil, fmt.Errorf("failed to generate nonce: %w", err)
 	}
 
 	// Encrypt plaintext
@@ -413,7 +450,91 @@ func encryptPayload(plaintext []byte) (ciphertext []byte, nonceB64 string, err e
 	// Encode nonce as base64 for storage
 	nonceB64 = base64.StdEncoding.EncodeToString(nonce)
 
-	return ciphertext, nonceB64, nil
+	return ciphertext, nonceB64, dek, nil
+}
+
+// wrapDEK wraps a DEK using AES-256-GCM with the given KEK.
+// Returns wrapped DEK (base64) and wrap nonce (base64).
+func wrapDEK(dek []byte, kek []byte) (wrappedDEKB64 string, wrapNonceB64 string, err error) {
+	// Create AES cipher with KEK
+	block, err := aes.NewCipher(kek)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create KEK cipher: %w", err)
+	}
+
+	// Create GCM mode
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create GCM for wrapping: %w", err)
+	}
+
+	// Generate random nonce for wrapping
+	wrapNonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, wrapNonce); err != nil {
+		return "", "", fmt.Errorf("failed to generate wrap nonce: %w", err)
+	}
+
+	// Wrap DEK
+	wrappedDEK := gcm.Seal(nil, wrapNonce, dek, nil)
+
+	// Encode as base64
+	wrappedDEKB64 = base64.StdEncoding.EncodeToString(wrappedDEK)
+	wrapNonceB64 = base64.StdEncoding.EncodeToString(wrapNonce)
+
+	return wrappedDEKB64, wrapNonceB64, nil
+}
+
+// unwrapDEK unwraps a wrapped DEK using AES-256-GCM with the given KEK.
+// Returns the unwrapped DEK.
+func unwrapDEK(wrappedDEKB64 string, wrapNonceB64 string, kek []byte) ([]byte, error) {
+	// Decode from base64
+	wrappedDEK, err := base64.StdEncoding.DecodeString(wrappedDEKB64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode wrapped DEK: %w", err)
+	}
+
+	wrapNonce, err := base64.StdEncoding.DecodeString(wrapNonceB64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode wrap nonce: %w", err)
+	}
+
+	// Create AES cipher with KEK
+	block, err := aes.NewCipher(kek)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create KEK cipher: %w", err)
+	}
+
+	// Create GCM mode
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create GCM for unwrapping: %w", err)
+	}
+
+	// Unwrap DEK
+	dek, err := gcm.Open(nil, wrapNonce, wrappedDEK, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unwrap DEK: %w", err)
+	}
+
+	return dek, nil
+}
+
+// deriveKEK derives a KEK from drand randomness using HKDF-SHA256.
+// IKM: drand randomness bytes
+// Salt: sealed item ID bytes
+// Info: "seal-dek-wrap-v1"
+func deriveKEK(randomness []byte, itemID string) ([]byte, error) {
+	salt := []byte(itemID)
+	info := []byte("seal-dek-wrap-v1")
+
+	kdf := hkdf.New(sha256.New, randomness, salt, info)
+	kek := make([]byte, 32)
+	
+	if _, err := io.ReadFull(kdf, kek); err != nil {
+		return nil, fmt.Errorf("failed to derive KEK: %w", err)
+	}
+
+	return kek, nil
 }
 
 // shredFile performs best-effort file shredding.
@@ -550,7 +671,7 @@ func getSealBaseDir() (string, error) {
 }
 
 // createSealedItem creates a new sealed item on disk.
-// Encrypts the payload using AES-256-GCM.
+// Encrypts the payload using AES-256-GCM with a fresh DEK.
 // Uses the provided time authority to generate a key reference.
 // Returns the item ID and error.
 func createSealedItem(unlockTime time.Time, inputType inputSource, originalPath string, plaintext []byte, authority TimeAuthority) (string, error) {
@@ -564,11 +685,17 @@ func createSealedItem(unlockTime time.Time, inputType inputSource, originalPath 
 		return "", fmt.Errorf("cannot create seal directory: %w", err)
 	}
 
-	// Encrypt payload
-	ciphertext, nonceB64, err := encryptPayload(plaintext)
+	// Encrypt payload (returns DEK for wrapping)
+	ciphertext, nonceB64, dek, err := encryptPayload(plaintext)
 	if err != nil {
 		return "", fmt.Errorf("encryption failed: %w", err)
 	}
+	defer func() {
+		// Zero out DEK from memory after use
+		for i := range dek {
+			dek[i] = 0
+		}
+	}()
 
 	// Lock with time authority to get key reference
 	keyRef, err := authority.Lock(unlockTime)
@@ -599,6 +726,28 @@ func createSealedItem(unlockTime time.Time, inputType inputSource, originalPath 
 		KeyRef:        string(keyRef),
 	}
 
+	// For drand authority, add DEK wrap metadata (wrapped_dek is null initially)
+	if authority.Name() == "drand" {
+		var drandRef DrandKeyReference
+		if err := json.Unmarshal([]byte(keyRef), &drandRef); err != nil {
+			return "", fmt.Errorf("failed to parse drand key reference: %w", err)
+		}
+
+		meta.DEKWrap = &DEKWrap{
+			Alg:         "drand-hkdf-aes-256-gcm",
+			TargetRound: drandRef.TargetRound,
+			WrapNonce:   nil,
+			WrappedDEK:  nil,
+		}
+
+		// Store unwrapped DEK temporarily in dek.bin (only for drand authority)
+		// This will be wrapped and moved to metadata during materialization
+		dekPath := filepath.Join(itemDir, "dek.bin")
+		if err := os.WriteFile(dekPath, dek, 0600); err != nil {
+			return "", fmt.Errorf("cannot write DEK: %w", err)
+		}
+	}
+
 	// Write metadata
 	metaPath := filepath.Join(itemDir, "meta.json")
 	metaJSON, err := json.MarshalIndent(meta, "", "  ")
@@ -619,31 +768,229 @@ func createSealedItem(unlockTime time.Time, inputType inputSource, originalPath 
 	return id, nil
 }
 
-// checkAndTransitionUnlock checks if a sealed item can be unlocked and transitions it.
-// This function defines the unlock flow but is currently inert (does not unlock).
-// 
-// When unlocking is implemented, decrypted data will be written to:
-//   <itemDir>/unsealed
-// 
-// This path must not exist while the item is in "sealed" state.
+// tryMaterialize attempts to materialize (unlock) a sealed item.
+// Materialization is passive - it only occurs when Seal code executes (e.g., seal status).
 // Returns the item (potentially with updated state) and any error.
-func checkAndTransitionUnlock(item SealedItem, itemDir string) (SealedItem, error) {
-	// If already unlocked, do nothing
+//
+// Decrypted data is written to: <itemDir>/unsealed
+// This path must not exist while the item is in "sealed" state.
+func tryMaterialize(item SealedItem, itemDir string, authority TimeAuthority) (SealedItem, error) {
+	// Precondition: If already unlocked, no-op
 	if item.State == "unlocked" {
 		return item, nil
 	}
 
-	// If still sealed, check conditions (currently inert - does not unlock)
-	if item.State == "sealed" {
-		// TODO: check time authority
-		// TODO: decrypt payload
-		// TODO: write to <itemDir>/unsealed
-		// TODO: update state to "unlocked"
-		// For now, do nothing
+	// Precondition: Only materialize drand authority items
+	if item.TimeAuthority != "drand" {
 		return item, nil
 	}
 
+	// Precondition: Check if unlocking is allowed
+	canUnlock, err := authority.CanUnlock(KeyReference(item.KeyRef), time.Now())
+	if err != nil {
+		// Network failure - do not unlock
+		return item, nil
+	}
+
+	if !canUnlock {
+		// Not yet time to unlock
+		return item, nil
+	}
+
+	// Parse drand key reference
+	var drandRef DrandKeyReference
+	if err := json.Unmarshal([]byte(item.KeyRef), &drandRef); err != nil {
+		return item, fmt.Errorf("invalid drand key reference: %w", err)
+	}
+
+	// Fetch drand randomness for exact target round
+	drandAuth, ok := authority.(*DrandAuthority)
+	if !ok {
+		return item, errors.New("authority is not DrandAuthority")
+	}
+
+	randomness, err := drandAuth.fetchRoundRandomness(drandRef.TargetRound)
+	if err != nil {
+		// Network failure - do not unlock
+		return item, nil
+	}
+
+	// Derive KEK from drand randomness + item ID
+	kek, err := deriveKEK(randomness, item.ID)
+	if err != nil {
+		return item, fmt.Errorf("failed to derive KEK: %w", err)
+	}
+	defer func() {
+		// Zero out KEK from memory
+		for i := range kek {
+			kek[i] = 0
+		}
+	}()
+
+	// If wrapped_dek is null, we need to wrap the DEK first
+	if item.DEKWrap == nil || item.DEKWrap.WrappedDEK == nil {
+		// Read unwrapped DEK from dek.bin
+		dekPath := filepath.Join(itemDir, "dek.bin")
+		dek, err := os.ReadFile(dekPath)
+		if err != nil {
+			return item, fmt.Errorf("failed to read DEK: %w", err)
+		}
+		defer func() {
+			// Zero out DEK from memory
+			for i := range dek {
+				dek[i] = 0
+			}
+		}()
+
+		// Wrap DEK with KEK
+		wrappedDEKB64, wrapNonceB64, err := wrapDEK(dek, kek)
+		if err != nil {
+			return item, fmt.Errorf("failed to wrap DEK: %w", err)
+		}
+
+		// Update metadata with wrapped DEK
+		if item.DEKWrap == nil {
+			item.DEKWrap = &DEKWrap{
+				Alg:         "drand-hkdf-aes-256-gcm",
+				TargetRound: drandRef.TargetRound,
+			}
+		}
+		item.DEKWrap.WrappedDEK = &wrappedDEKB64
+		item.DEKWrap.WrapNonce = &wrapNonceB64
+
+		// Persist updated metadata atomically
+		metaPath := filepath.Join(itemDir, "meta.json")
+		metaJSON, err := json.MarshalIndent(item, "", "  ")
+		if err != nil {
+			return item, fmt.Errorf("failed to marshal metadata: %w", err)
+		}
+
+		tmpMetaPath := metaPath + ".tmp"
+		if err := os.WriteFile(tmpMetaPath, metaJSON, 0600); err != nil {
+			return item, fmt.Errorf("failed to write metadata: %w", err)
+		}
+
+		if err := os.Rename(tmpMetaPath, metaPath); err != nil {
+			os.Remove(tmpMetaPath)
+			return item, fmt.Errorf("failed to update metadata: %w", err)
+		}
+
+		// Delete dek.bin (no longer needed)
+		os.Remove(dekPath)
+	}
+
+	// At this point, wrapped_dek should be available
+	if item.DEKWrap == nil || item.DEKWrap.WrappedDEK == nil || item.DEKWrap.WrapNonce == nil {
+		return item, errors.New("wrapped DEK not available")
+	}
+
+	// Unwrap DEK
+	dek, err := unwrapDEK(*item.DEKWrap.WrappedDEK, *item.DEKWrap.WrapNonce, kek)
+	if err != nil {
+		return item, fmt.Errorf("failed to unwrap DEK: %w", err)
+	}
+	defer func() {
+		// Zero out DEK from memory
+		for i := range dek {
+			dek[i] = 0
+		}
+	}()
+
+	// Read encrypted payload
+	payloadPath := filepath.Join(itemDir, "payload.bin")
+	ciphertext, err := os.ReadFile(payloadPath)
+	if err != nil {
+		return item, fmt.Errorf("failed to read payload: %w", err)
+	}
+
+	// Decode nonce
+	nonce, err := base64.StdEncoding.DecodeString(item.Nonce)
+	if err != nil {
+		return item, fmt.Errorf("failed to decode nonce: %w", err)
+	}
+
+	// Decrypt payload
+	block, err := aes.NewCipher(dek)
+	if err != nil {
+		return item, fmt.Errorf("failed to create cipher: %w", err)
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return item, fmt.Errorf("failed to create GCM: %w", err)
+	}
+
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return item, fmt.Errorf("failed to decrypt payload: %w", err)
+	}
+
+	// Write unsealed data atomically
+	unsealedPath := filepath.Join(itemDir, "unsealed")
+	tmpUnsealedPath := unsealedPath + ".tmp"
+
+	if err := os.WriteFile(tmpUnsealedPath, plaintext, 0600); err != nil {
+		return item, fmt.Errorf("failed to write unsealed data: %w", err)
+	}
+
+	// Sync to disk
+	tmpFile, err := os.OpenFile(tmpUnsealedPath, os.O_RDONLY, 0)
+	if err != nil {
+		os.Remove(tmpUnsealedPath)
+		return item, fmt.Errorf("failed to open unsealed data for sync: %w", err)
+	}
+	if err := tmpFile.Sync(); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpUnsealedPath)
+		return item, fmt.Errorf("failed to sync unsealed data: %w", err)
+	}
+	tmpFile.Close()
+
+	// Atomic rename
+	if err := os.Rename(tmpUnsealedPath, unsealedPath); err != nil {
+		os.Remove(tmpUnsealedPath)
+		return item, fmt.Errorf("failed to rename unsealed data: %w", err)
+	}
+
+	// Update state to unlocked
+	item.State = "unlocked"
+
+	// Persist updated state
+	metaPath := filepath.Join(itemDir, "meta.json")
+	metaJSON, err := json.MarshalIndent(item, "", "  ")
+	if err != nil {
+		return item, fmt.Errorf("failed to marshal metadata: %w", err)
+	}
+
+	tmpMetaPath := metaPath + ".tmp"
+	if err := os.WriteFile(tmpMetaPath, metaJSON, 0600); err != nil {
+		return item, fmt.Errorf("failed to write metadata: %w", err)
+	}
+
+	if err := os.Rename(tmpMetaPath, metaPath); err != nil {
+		os.Remove(tmpMetaPath)
+		return item, fmt.Errorf("failed to update metadata: %w", err)
+	}
+
 	return item, nil
+}
+
+// checkAndTransitionUnlock wraps tryMaterialize with the appropriate authority.
+func checkAndTransitionUnlock(item SealedItem, itemDir string) (SealedItem, error) {
+	if item.State == "unlocked" {
+		return item, nil
+	}
+
+	// Get authority based on item metadata
+	var authority TimeAuthority
+	if item.TimeAuthority == "drand" {
+		authority = NewDrandAuthority()
+	} else {
+		// Placeholder or unknown authority - no materialization
+		return item, nil
+	}
+
+	return tryMaterialize(item, itemDir, authority)
 }
 
 // listSealedItems returns all sealed items, sorted by creation time (oldest first).

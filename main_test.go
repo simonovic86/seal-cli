@@ -779,9 +779,14 @@ func decryptPayloadForTest(ciphertext []byte, nonceB64 string, key []byte) ([]by
 func TestEncryptPayload_ProducesNonPlaintext(t *testing.T) {
 	plaintext := []byte("this is a secret message")
 
-	ciphertext, nonceB64, err := encryptPayload(plaintext)
+	ciphertext, nonceB64, dek, err := encryptPayload(plaintext)
 	if err != nil {
 		t.Fatalf("encryptPayload failed: %v", err)
+	}
+
+	// Verify DEK is returned
+	if len(dek) != 32 {
+		t.Errorf("expected DEK size 32, got %d", len(dek))
 	}
 
 	// Verify ciphertext is different from plaintext
@@ -836,14 +841,17 @@ func TestEncryptPayload_RoundTrip(t *testing.T) {
 			os.Setenv("HOME", tmpDir)
 			os.Setenv("XDG_DATA_HOME", "")
 
-			// Note: We can't actually test round-trip without the key,
-			// which is intentionally discarded. This test verifies the
-			// encryption happens and produces valid output structure.
+			// Now we get the DEK back, so we can test round-trip
 
-			ciphertext, nonceB64, err := encryptPayload(tc.plaintext)
+			ciphertext, nonceB64, dek, err := encryptPayload(tc.plaintext)
 			if err != nil {
 				t.Fatalf("encryption failed: %v", err)
 			}
+			defer func() {
+				for i := range dek {
+					dek[i] = 0
+				}
+			}()
 
 			// Verify structure
 			if len(nonceB64) == 0 {
@@ -875,9 +883,13 @@ func TestEncryptPayload_DifferentNoncesEachTime(t *testing.T) {
 	// Encrypt multiple times
 	var nonces []string
 	for i := 0; i < 5; i++ {
-		_, nonceB64, err := encryptPayload(plaintext)
+		_, nonceB64, dek, err := encryptPayload(plaintext)
 		if err != nil {
 			t.Fatalf("encryption %d failed: %v", i, err)
+		}
+		// Zero out DEK
+		for j := range dek {
+			dek[j] = 0
 		}
 		nonces = append(nonces, nonceB64)
 	}
@@ -898,9 +910,13 @@ func TestEncryptPayload_DifferentCiphertextEachTime(t *testing.T) {
 	// Encrypt multiple times
 	var ciphertexts [][]byte
 	for i := 0; i < 5; i++ {
-		ciphertext, _, err := encryptPayload(plaintext)
+		ciphertext, _, dek, err := encryptPayload(plaintext)
 		if err != nil {
 			t.Fatalf("encryption %d failed: %v", i, err)
+		}
+		// Zero out DEK
+		for j := range dek {
+			dek[j] = 0
 		}
 		ciphertexts = append(ciphertexts, ciphertext)
 	}
@@ -2119,5 +2135,225 @@ func TestCreateSealedItem_WithDrandAuthority(t *testing.T) {
 	// Verify state is sealed
 	if meta.State != "sealed" {
 		t.Errorf("expected state 'sealed', got %s", meta.State)
+	}
+
+	// Verify DEKWrap exists for drand authority
+	if meta.DEKWrap == nil {
+		t.Error("DEKWrap should exist for drand authority")
+	} else {
+		if meta.DEKWrap.Alg != "drand-hkdf-aes-256-gcm" {
+			t.Errorf("expected alg 'drand-hkdf-aes-256-gcm', got %s", meta.DEKWrap.Alg)
+		}
+
+		if meta.DEKWrap.TargetRound == 0 {
+			t.Error("target round should not be zero")
+		}
+
+		if meta.DEKWrap.WrappedDEK != nil {
+			t.Error("wrapped_dek should be null at seal time")
+		}
+
+		if meta.DEKWrap.WrapNonce != nil {
+			t.Error("wrap_nonce should be null at seal time")
+		}
+	}
+
+	// Verify dek.bin exists for drand authority
+	dekPath := filepath.Join(baseDir, id, "dek.bin")
+	dekData, err := os.ReadFile(dekPath)
+	if err != nil {
+		t.Fatalf("dek.bin should exist for drand authority: %v", err)
+	}
+
+	if len(dekData) != 32 {
+		t.Errorf("DEK should be 32 bytes, got %d", len(dekData))
+	}
+}
+
+func TestWrapUnwrapDEK_RoundTrip(t *testing.T) {
+	dek := make([]byte, 32)
+	for i := range dek {
+		dek[i] = byte(i)
+	}
+
+	kek := make([]byte, 32)
+	for i := range kek {
+		kek[i] = byte(i + 100)
+	}
+
+	// Wrap DEK
+	wrappedDEKB64, wrapNonceB64, err := wrapDEK(dek, kek)
+	if err != nil {
+		t.Fatalf("wrapDEK failed: %v", err)
+	}
+
+	// Unwrap DEK
+	unwrappedDEK, err := unwrapDEK(wrappedDEKB64, wrapNonceB64, kek)
+	if err != nil {
+		t.Fatalf("unwrapDEK failed: %v", err)
+	}
+
+	// Verify round-trip
+	if !bytes.Equal(dek, unwrappedDEK) {
+		t.Errorf("DEK mismatch after round-trip")
+	}
+}
+
+func TestDeriveKEK_Deterministic(t *testing.T) {
+	randomness := []byte("test-randomness-bytes-for-kek-derivation")
+	itemID := "test-item-id-123"
+
+	// Derive KEK twice
+	kek1, err := deriveKEK(randomness, itemID)
+	if err != nil {
+		t.Fatalf("deriveKEK failed: %v", err)
+	}
+
+	kek2, err := deriveKEK(randomness, itemID)
+	if err != nil {
+		t.Fatalf("deriveKEK failed: %v", err)
+	}
+
+	// Should be identical (deterministic)
+	if !bytes.Equal(kek1, kek2) {
+		t.Error("KEK derivation should be deterministic")
+	}
+
+	// Should be 32 bytes
+	if len(kek1) != 32 {
+		t.Errorf("expected KEK size 32, got %d", len(kek1))
+	}
+}
+
+func TestDeriveKEK_DifferentInputs(t *testing.T) {
+	randomness1 := []byte("randomness-1")
+	randomness2 := []byte("randomness-2")
+	itemID1 := "item-1"
+	itemID2 := "item-2"
+
+	kek1, _ := deriveKEK(randomness1, itemID1)
+	kek2, _ := deriveKEK(randomness2, itemID1)
+	kek3, _ := deriveKEK(randomness1, itemID2)
+
+	// Different randomness -> different KEK
+	if bytes.Equal(kek1, kek2) {
+		t.Error("different randomness should produce different KEKs")
+	}
+
+	// Different item ID -> different KEK
+	if bytes.Equal(kek1, kek3) {
+		t.Error("different item IDs should produce different KEKs")
+	}
+}
+
+func TestCreateSealedItem_DrandAuthority_InitializesDEKWrap(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldHome := os.Getenv("HOME")
+	oldXDGDataHome := os.Getenv("XDG_DATA_HOME")
+	defer func() {
+		os.Setenv("HOME", oldHome)
+		os.Setenv("XDG_DATA_HOME", oldXDGDataHome)
+	}()
+
+	os.Setenv("HOME", tmpDir)
+	os.Setenv("XDG_DATA_HOME", "")
+
+	unlockTime := time.Now().UTC().Add(24 * time.Hour)
+	plaintext := []byte("test data")
+	authority := NewDrandAuthority()
+
+	id, err := createSealedItem(unlockTime, inputSourceStdin, "", plaintext, authority)
+	if err != nil {
+		t.Skipf("skipping due to error (likely network): %v", err)
+	}
+
+	// Read metadata
+	baseDir, _ := getSealBaseDir()
+	metaPath := filepath.Join(baseDir, id, "meta.json")
+	metaData, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("failed to read metadata: %v", err)
+	}
+
+	var meta SealedItem
+	if err := json.Unmarshal(metaData, &meta); err != nil {
+		t.Fatalf("failed to unmarshal metadata: %v", err)
+	}
+
+	// Verify DEKWrap is initialized
+	if meta.DEKWrap == nil {
+		t.Fatal("DEKWrap should be initialized for drand authority")
+	}
+
+	if meta.DEKWrap.Alg != "drand-hkdf-aes-256-gcm" {
+		t.Errorf("expected alg 'drand-hkdf-aes-256-gcm', got %s", meta.DEKWrap.Alg)
+	}
+
+	if meta.DEKWrap.WrappedDEK != nil {
+		t.Error("wrapped_dek should be null at seal time")
+	}
+
+	if meta.DEKWrap.WrapNonce != nil {
+		t.Error("wrap_nonce should be null at seal time")
+	}
+
+	// Verify dek.bin exists
+	dekPath := filepath.Join(baseDir, id, "dek.bin")
+	if _, err := os.Stat(dekPath); os.IsNotExist(err) {
+		t.Error("dek.bin should exist for drand authority")
+	}
+}
+
+func TestMaterialize_PlaceholderAuthority_NoOp(t *testing.T) {
+	tmpDir := t.TempDir()
+	itemDir := filepath.Join(tmpDir, "test-item")
+	os.MkdirAll(itemDir, 0700)
+
+	item := SealedItem{
+		ID:            "test-id",
+		State:         "sealed",
+		UnlockTime:    time.Now().UTC().Add(-24 * time.Hour), // In the past
+		TimeAuthority: "placeholder",
+	}
+
+	authority := &PlaceholderAuthority{}
+
+	result, err := tryMaterialize(item, itemDir, authority)
+	if err != nil {
+		t.Fatalf("tryMaterialize should not error for placeholder: %v", err)
+	}
+
+	// Should remain sealed (no-op for placeholder)
+	if result.State != "sealed" {
+		t.Errorf("state should remain sealed for placeholder authority, got %s", result.State)
+	}
+
+	// Unsealed file should not exist
+	unsealedPath := filepath.Join(itemDir, "unsealed")
+	if _, err := os.Stat(unsealedPath); !os.IsNotExist(err) {
+		t.Error("unsealed file should not exist for placeholder authority")
+	}
+}
+
+func TestMaterialize_AlreadyUnlocked_NoOp(t *testing.T) {
+	tmpDir := t.TempDir()
+	itemDir := filepath.Join(tmpDir, "test-item")
+
+	item := SealedItem{
+		ID:            "test-id",
+		State:         "unlocked",
+		TimeAuthority: "drand",
+	}
+
+	authority := NewDrandAuthority()
+
+	result, err := tryMaterialize(item, itemDir, authority)
+	if err != nil {
+		t.Fatalf("tryMaterialize should not error for unlocked item: %v", err)
+	}
+
+	// Should remain unlocked
+	if result.State != "unlocked" {
+		t.Errorf("state should remain unlocked, got %s", result.State)
 	}
 }
