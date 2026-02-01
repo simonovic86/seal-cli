@@ -471,8 +471,10 @@ func TestCreateSealedItem_And_List(t *testing.T) {
 	testPayload := []byte("test sealed content")
 	testPath := "/test/path.txt"
 
+	authority := &PlaceholderAuthority{}
+
 	// Create sealed item
-	id, err := createSealedItem(unlockTime, inputSourceFile, testPath, testPayload)
+	id, err := createSealedItem(unlockTime, inputSourceFile, testPath, testPayload, authority)
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -536,8 +538,8 @@ func TestCreateSealedItem_And_List(t *testing.T) {
 		t.Error("Nonce should not be empty")
 	}
 
-	if meta.KeyRef != "placeholder" {
-		t.Errorf("KeyRef mismatch: got %s, want placeholder", meta.KeyRef)
+	if meta.KeyRef != "placeholder-key-ref" {
+		t.Errorf("KeyRef mismatch: got %s, want placeholder-key-ref", meta.KeyRef)
 	}
 
 	// Check payload.bin exists and is encrypted
@@ -585,7 +587,7 @@ func TestMetadata_RoundTrip(t *testing.T) {
 		CreatedAt:     createdAt,
 		Algorithm:     "aes-256-gcm",
 		Nonce:         "dGVzdG5vbmNl",
-		KeyRef:        "placeholder",
+		KeyRef:        "placeholder-key-ref",
 	}
 
 	// Marshal to JSON
@@ -677,6 +679,7 @@ func TestListSealedItems_MultipleSorted(t *testing.T) {
 	os.Setenv("XDG_DATA_HOME", "")
 
 	unlockTime := time.Now().UTC().Add(24 * time.Hour)
+	authority := &PlaceholderAuthority{}
 	
 	// Create multiple items with slight delays to ensure different creation times
 	var ids []string
@@ -686,6 +689,7 @@ func TestListSealedItems_MultipleSorted(t *testing.T) {
 			inputSourceStdin,
 			"",
 			[]byte("test content "+string(rune('A'+i))),
+			authority,
 		)
 		if err != nil {
 			t.Fatalf("failed to create item %d: %v", i, err)
@@ -921,8 +925,9 @@ func TestCreateSealedItem_EncryptsPayload(t *testing.T) {
 
 	unlockTime := time.Now().UTC().Add(24 * time.Hour)
 	plaintext := []byte("secret data to seal")
+	authority := &PlaceholderAuthority{}
 
-	id, err := createSealedItem(unlockTime, inputSourceStdin, "", plaintext)
+	id, err := createSealedItem(unlockTime, inputSourceStdin, "", plaintext, authority)
 	if err != nil {
 		t.Fatalf("createSealedItem failed: %v", err)
 	}
@@ -949,8 +954,8 @@ func TestCreateSealedItem_EncryptsPayload(t *testing.T) {
 		t.Error("nonce should not be empty")
 	}
 
-	if meta.KeyRef != "placeholder" {
-		t.Errorf("expected key_ref 'placeholder', got %s", meta.KeyRef)
+	if meta.KeyRef != "placeholder-key-ref" {
+		t.Errorf("expected key_ref 'placeholder-key-ref', got %s", meta.KeyRef)
 	}
 
 	// Verify nonce decodes properly
@@ -994,7 +999,7 @@ func TestMetadata_IncludesCryptoFields(t *testing.T) {
 		CreatedAt:     createdAt,
 		Algorithm:     "aes-256-gcm",
 		Nonce:         "dGVzdG5vbmNl",
-		KeyRef:        "placeholder",
+		KeyRef:        "placeholder-key-ref",
 	}
 
 	// Marshal to JSON
@@ -1018,8 +1023,8 @@ func TestMetadata_IncludesCryptoFields(t *testing.T) {
 		t.Errorf("Nonce mismatch: got %s, want dGVzdG5vbmNl", decoded.Nonce)
 	}
 
-	if decoded.KeyRef != "placeholder" {
-		t.Errorf("KeyRef mismatch: got %s, want placeholder", decoded.KeyRef)
+	if decoded.KeyRef != "placeholder-key-ref" {
+		t.Errorf("KeyRef mismatch: got %s, want placeholder-key-ref", decoded.KeyRef)
 	}
 }
 
@@ -1602,5 +1607,103 @@ func TestLockCommand_ClearClipboard_FailureDoesNotAbortSealing(t *testing.T) {
 	expectedWarning := "warning: clipboard clearing is best-effort; the OS or other apps may retain copies"
 	if !strings.Contains(stderrStr, expectedWarning) {
 		t.Errorf("stderr should contain mandatory warning, got: %q", stderrStr)
+	}
+}
+
+func TestPlaceholderAuthority_Name(t *testing.T) {
+	authority := &PlaceholderAuthority{}
+	
+	if authority.Name() != "placeholder" {
+		t.Errorf("expected name 'placeholder', got %s", authority.Name())
+	}
+}
+
+func TestPlaceholderAuthority_Lock(t *testing.T) {
+	authority := &PlaceholderAuthority{}
+	unlockTime := time.Now().UTC().Add(24 * time.Hour)
+
+	ref, err := authority.Lock(unlockTime)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	// Should return a deterministic key reference
+	if ref == "" {
+		t.Error("key reference should not be empty")
+	}
+
+	if string(ref) != "placeholder-key-ref" {
+		t.Errorf("expected key reference 'placeholder-key-ref', got %s", ref)
+	}
+}
+
+func TestPlaceholderAuthority_CanUnlock_AlwaysFalse(t *testing.T) {
+	authority := &PlaceholderAuthority{}
+	ref := KeyReference("placeholder-key-ref")
+
+	testCases := []struct {
+		name string
+		now  time.Time
+	}{
+		{"past", time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)},
+		{"present", time.Now().UTC()},
+		{"future", time.Now().UTC().Add(100 * 365 * 24 * time.Hour)},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			canUnlock, err := authority.CanUnlock(ref, tc.now)
+			if err != nil {
+				t.Fatalf("expected no error, got: %v", err)
+			}
+
+			if canUnlock {
+				t.Error("placeholder authority should never permit unlocking")
+			}
+		})
+	}
+}
+
+func TestCreateSealedItem_StoresAuthorityMetadata(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldHome := os.Getenv("HOME")
+	oldXDGDataHome := os.Getenv("XDG_DATA_HOME")
+	defer func() {
+		os.Setenv("HOME", oldHome)
+		os.Setenv("XDG_DATA_HOME", oldXDGDataHome)
+	}()
+
+	os.Setenv("HOME", tmpDir)
+	os.Setenv("XDG_DATA_HOME", "")
+
+	unlockTime := time.Now().UTC().Add(24 * time.Hour)
+	plaintext := []byte("test data")
+	authority := &PlaceholderAuthority{}
+
+	id, err := createSealedItem(unlockTime, inputSourceStdin, "", plaintext, authority)
+	if err != nil {
+		t.Fatalf("createSealedItem failed: %v", err)
+	}
+
+	// Read back metadata
+	baseDir, _ := getSealBaseDir()
+	metaPath := filepath.Join(baseDir, id, "meta.json")
+	metaData, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("failed to read metadata: %v", err)
+	}
+
+	var meta SealedItem
+	if err := json.Unmarshal(metaData, &meta); err != nil {
+		t.Fatalf("failed to unmarshal metadata: %v", err)
+	}
+
+	// Verify authority metadata
+	if meta.TimeAuthority != "placeholder" {
+		t.Errorf("expected time_authority 'placeholder', got %s", meta.TimeAuthority)
+	}
+
+	if meta.KeyRef != "placeholder-key-ref" {
+		t.Errorf("expected key_ref 'placeholder-key-ref', got %s", meta.KeyRef)
 	}
 }

@@ -38,6 +38,41 @@ func (i inputSource) String() string {
 	return "stdin"
 }
 
+// KeyReference is an opaque reference to a time-locked encryption key.
+type KeyReference string
+
+// TimeAuthority is an external, verifiable source of truth for time-based unlocking.
+type TimeAuthority interface {
+	// Name returns the identifier for this time authority.
+	Name() string
+
+	// Lock creates a time-locked key reference for the given unlock time.
+	// Returns an opaque key reference that can later be used to determine unlock eligibility.
+	Lock(unlockTime time.Time) (KeyReference, error)
+
+	// CanUnlock determines whether the unlock time has been reached.
+	// Returns true if unlocking is permitted, false otherwise.
+	CanUnlock(ref KeyReference, now time.Time) (bool, error)
+}
+
+// PlaceholderAuthority is a no-op time authority for testing and development.
+// It never permits unlocking.
+type PlaceholderAuthority struct{}
+
+func (p *PlaceholderAuthority) Name() string {
+	return "placeholder"
+}
+
+func (p *PlaceholderAuthority) Lock(unlockTime time.Time) (KeyReference, error) {
+	// Return a dummy key reference
+	return KeyReference("placeholder-key-ref"), nil
+}
+
+func (p *PlaceholderAuthority) CanUnlock(ref KeyReference, now time.Time) (bool, error) {
+	// Always returns false - no unlocking permitted
+	return false, nil
+}
+
 // SealedItem represents metadata for a sealed item.
 type SealedItem struct {
 	ID              string    `json:"id"`
@@ -361,8 +396,9 @@ func getSealBaseDir() (string, error) {
 
 // createSealedItem creates a new sealed item on disk.
 // Encrypts the payload using AES-256-GCM.
+// Uses the provided time authority to generate a key reference.
 // Returns the item ID and error.
-func createSealedItem(unlockTime time.Time, inputType inputSource, originalPath string, plaintext []byte) (string, error) {
+func createSealedItem(unlockTime time.Time, inputType inputSource, originalPath string, plaintext []byte, authority TimeAuthority) (string, error) {
 	baseDir, err := getSealBaseDir()
 	if err != nil {
 		return "", err
@@ -377,6 +413,12 @@ func createSealedItem(unlockTime time.Time, inputType inputSource, originalPath 
 	ciphertext, nonceB64, err := encryptPayload(plaintext)
 	if err != nil {
 		return "", fmt.Errorf("encryption failed: %w", err)
+	}
+
+	// Lock with time authority to get key reference
+	keyRef, err := authority.Lock(unlockTime)
+	if err != nil {
+		return "", fmt.Errorf("time authority lock failed: %w", err)
 	}
 
 	// Generate UUID for this sealed item
@@ -394,11 +436,11 @@ func createSealedItem(unlockTime time.Time, inputType inputSource, originalPath 
 		UnlockTime:    unlockTime.UTC(),
 		InputType:     inputType.String(),
 		OriginalPath:  originalPath,
-		TimeAuthority: "placeholder", // TODO: implement time authority
+		TimeAuthority: authority.Name(),
 		CreatedAt:     time.Now().UTC(),
 		Algorithm:     "aes-256-gcm",
 		Nonce:         nonceB64,
-		KeyRef:        "placeholder", // TODO: implement key escrow/time-lock
+		KeyRef:        string(keyRef),
 	}
 
 	// Write metadata
@@ -535,8 +577,11 @@ func handleLock(args []string) {
 		fmt.Fprintln(os.Stderr, "warning: clipboard clearing is best-effort; the OS or other apps may retain copies")
 	}
 
+	// Create time authority
+	authority := &PlaceholderAuthority{}
+
 	// Create sealed item with encrypted payload
-	id, err := createSealedItem(unlockTime, inputSrc, inputPath, inputData)
+	id, err := createSealedItem(unlockTime, inputSrc, inputPath, inputData, authority)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
