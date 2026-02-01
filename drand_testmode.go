@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // testModeHTTPDoer is a mock HTTP client for test mode.
@@ -35,8 +36,15 @@ func (t *testModeHTTPDoer) Do(req *http.Request) (*http.Response, error) {
 
 	// Handle /public/latest endpoint
 	if strings.HasSuffix(path, "/public/latest") {
+		// Calculate current round based on real time
+		// Genesis: 1677685200 (2023-03-01 13:00:00 UTC), Period: 3 seconds
+		genesisTime := int64(1677685200)
+		period := int64(3)
+		now := time.Now().Unix()
+		currentRound := uint64((now - genesisTime) / period)
+		
 		resp := drandPublicResponse{
-			Round:      999999999, // Very high round so unlock always succeeds
+			Round:      currentRound,
 			Randomness: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
 		}
 		body, _ := json.Marshal(resp)

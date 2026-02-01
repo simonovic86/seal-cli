@@ -2559,3 +2559,195 @@ func TestPlaceholderSealedItems_NeverMaterialize(t *testing.T) {
 		t.Error("unsealed file should never be created for placeholder-sealed items")
 	}
 }
+
+func TestStatusCommand_BeforeUnlock_ReportsSealed(t *testing.T) {
+	binPath := filepath.Join(t.TempDir(), "seal-test")
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
+	if output, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to build binary: %v\n%s", err, output)
+	}
+
+	tmpHome := t.TempDir()
+
+	// Create a sealed item with future unlock time
+	lockCmd := exec.Command(binPath, "lock", "--until", "2099-12-31T23:59:59Z")
+	lockCmd.Stdin = strings.NewReader("test data")
+	lockCmd.Env = append(os.Environ(), "HOME="+tmpHome, "XDG_DATA_HOME=")
+
+	var lockStdout bytes.Buffer
+	lockCmd.Stdout = &lockStdout
+	if err := lockCmd.Run(); err != nil {
+		t.Fatalf("seal lock failed: %v", err)
+	}
+
+	itemID := strings.TrimSpace(lockStdout.String())
+
+	// Run seal status
+	statusCmd := exec.Command(binPath, "status")
+	statusCmd.Env = append(os.Environ(), "HOME="+tmpHome, "XDG_DATA_HOME=")
+
+	var statusStdout bytes.Buffer
+	statusCmd.Stdout = &statusStdout
+	if err := statusCmd.Run(); err != nil {
+		t.Fatalf("seal status failed: %v", err)
+	}
+
+	output := statusStdout.String()
+
+	// Verify output contains the item ID and sealed state
+	if !strings.Contains(output, itemID) {
+		t.Errorf("status output should contain item ID, got: %s", output)
+	}
+
+	if !strings.Contains(output, "state: sealed") {
+		t.Errorf("status output should show 'state: sealed', got: %s", output)
+	}
+
+	if strings.Contains(output, "state: unlocked") {
+		t.Errorf("status output should not show 'state: unlocked' for future unlock time, got: %s", output)
+	}
+}
+
+func TestStatusCommand_AfterUnlock_ReportsUnlocked(t *testing.T) {
+	binPath := filepath.Join(t.TempDir(), "seal-test")
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
+	if output, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to build binary: %v\n%s", err, output)
+	}
+
+	tmpHome := t.TempDir()
+
+	// Create a sealed item with near-future unlock time (will unlock quickly in test mode)
+	// Use a time 5 seconds in the future - drand rounds every 3 seconds, so this will be
+	// unlockable after 1-2 rounds
+	unlockTime := time.Now().UTC().Add(5 * time.Second)
+	lockCmd := exec.Command(binPath, "lock", "--until", unlockTime.Format(time.RFC3339))
+	lockCmd.Stdin = strings.NewReader("test data for unlock")
+	lockCmd.Env = append(os.Environ(), "HOME="+tmpHome, "XDG_DATA_HOME=")
+
+	var lockStdout bytes.Buffer
+	lockCmd.Stdout = &lockStdout
+	if err := lockCmd.Run(); err != nil {
+		t.Fatalf("seal lock failed: %v", err)
+	}
+
+	itemID := strings.TrimSpace(lockStdout.String())
+	
+	// Sleep to ensure the unlock time has passed (wait for drand rounds to catch up)
+	time.Sleep(6 * time.Second)
+
+	// Run seal status - should trigger materialization
+	statusCmd := exec.Command(binPath, "status")
+	statusCmd.Env = append(os.Environ(), "HOME="+tmpHome, "XDG_DATA_HOME=")
+
+	var statusStdout bytes.Buffer
+	statusCmd.Stdout = &statusStdout
+	if err := statusCmd.Run(); err != nil {
+		t.Fatalf("seal status failed: %v", err)
+	}
+
+	output := statusStdout.String()
+
+	// Verify output shows unlocked state
+	if !strings.Contains(output, itemID) {
+		t.Errorf("status output should contain item ID, got: %s", output)
+	}
+
+	if !strings.Contains(output, "state: unlocked") {
+		t.Errorf("status output should show 'state: unlocked', got: %s", output)
+	}
+
+	// Verify unsealed file exists
+	var baseDir string
+	if runtime.GOOS == "darwin" {
+		baseDir = filepath.Join(tmpHome, "Library", "Application Support", "seal")
+	} else {
+		baseDir = filepath.Join(tmpHome, ".local", "share", "seal")
+	}
+
+	unsealedPath := filepath.Join(baseDir, itemID, "unsealed")
+	if _, err := os.Stat(unsealedPath); os.IsNotExist(err) {
+		t.Error("unsealed file should exist after materialization")
+	}
+
+	// Run status again - should be idempotent (still show unlocked, no errors)
+	statusCmd2 := exec.Command(binPath, "status")
+	statusCmd2.Env = append(os.Environ(), "HOME="+tmpHome, "XDG_DATA_HOME=")
+
+	var statusStdout2 bytes.Buffer
+	statusCmd2.Stdout = &statusStdout2
+	if err := statusCmd2.Run(); err != nil {
+		t.Fatalf("second seal status failed: %v", err)
+	}
+
+	output2 := statusStdout2.String()
+	if !strings.Contains(output2, "state: unlocked") {
+		t.Errorf("second status should still show 'state: unlocked', got: %s", output2)
+	}
+}
+
+func TestStatusCommand_NoSpecialMessageOnUnlock(t *testing.T) {
+	binPath := filepath.Join(t.TempDir(), "seal-test")
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
+	if output, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to build binary: %v\n%s", err, output)
+	}
+
+	tmpHome := t.TempDir()
+
+	// Create a sealed item with near-future unlock time
+	unlockTime := time.Now().UTC().Add(5 * time.Second)
+	lockCmd := exec.Command(binPath, "lock", "--until", unlockTime.Format(time.RFC3339))
+	lockCmd.Stdin = strings.NewReader("test data")
+	lockCmd.Env = append(os.Environ(), "HOME="+tmpHome, "XDG_DATA_HOME=")
+
+	var lockStdout bytes.Buffer
+	lockCmd.Stdout = &lockStdout
+	if err := lockCmd.Run(); err != nil {
+		t.Fatalf("seal lock failed: %v", err)
+	}
+	
+	// Sleep to ensure the unlock time has passed
+	time.Sleep(6 * time.Second)
+
+	// Run seal status - will trigger unlock
+	statusCmd := exec.Command(binPath, "status")
+	statusCmd.Env = append(os.Environ(), "HOME="+tmpHome, "XDG_DATA_HOME=")
+
+	var statusStdout, statusStderr bytes.Buffer
+	statusCmd.Stdout = &statusStdout
+	statusCmd.Stderr = &statusStderr
+	if err := statusCmd.Run(); err != nil {
+		t.Fatalf("seal status failed: %v", err)
+	}
+
+	output := statusStdout.String()
+	stderrOutput := statusStderr.String()
+
+	// Verify no special messages about unlocking
+	forbiddenPhrases := []string{
+		"now unlocked",
+		"now materialized",
+		"now decrypted",
+		"now unsealed",
+		"now available",
+		"item unlocked",
+		"item materialized",
+		"successfully unlocked",
+		"successfully materialized",
+	}
+
+	// Check stderr is empty (no special messages)
+	if stderrOutput != "" {
+		t.Errorf("stderr should be empty on successful unlock, got: %s", stderrOutput)
+	}
+
+	// Check stdout doesn't contain unlock notification phrases
+	// (it will contain "state: unlocked" which is fine - that's the status report)
+	lowerOutput := strings.ToLower(output)
+	for _, phrase := range forbiddenPhrases {
+		if strings.Contains(lowerOutput, phrase) {
+			t.Errorf("output should not contain special unlock message with phrase '%s', got: %s", phrase, output)
+		}
+	}
+}

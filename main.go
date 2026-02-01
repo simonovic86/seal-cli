@@ -1099,8 +1099,56 @@ func handleStatus(args []string) {
 		os.Exit(0)
 	}
 
+	baseDir, err := getSealBaseDir()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Track materialization errors
+	var materializationFailed bool
+	var firstError error
+
+	// Attempt materialization for each item, then report post-materialization state
+	for i := range items {
+		itemDir := filepath.Join(baseDir, items[i].ID)
+		originalState := items[i].State
+		
+		// Attempt materialization (idempotent - no-op if already unlocked)
+		updatedItem, err := checkAndTransitionUnlock(items[i], itemDir)
+		if err != nil {
+			// Track error but continue processing other items
+			if !materializationFailed {
+				firstError = err
+				materializationFailed = true
+			}
+			// Item remains in its current state (sealed)
+		} else {
+			// Update to post-materialization state
+			items[i] = updatedItem
+			
+			// Persist state change if it occurred
+			if updatedItem.State != originalState {
+				metaPath := filepath.Join(itemDir, "meta.json")
+				metaData, _ := json.MarshalIndent(updatedItem, "", "  ")
+				os.WriteFile(metaPath, metaData, 0600)
+			}
+		}
+	}
+
+	// Print all items with their post-materialization state
 	for _, item := range items {
-		fmt.Printf("%s %s %s\n", item.ID, item.UnlockTime.Format(time.RFC3339), item.InputType)
+		fmt.Printf("id: %s\nstate: %s\nunlock_time: %s\ninput_type: %s\n\n",
+			item.ID,
+			item.State,
+			item.UnlockTime.Format(time.RFC3339),
+			item.InputType)
+	}
+
+	// Exit with error if any materialization failed
+	if materializationFailed {
+		fmt.Fprintf(os.Stderr, "error: materialization failed: %v\n", firstError)
+		os.Exit(1)
 	}
 
 	os.Exit(0)
