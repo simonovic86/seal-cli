@@ -45,6 +45,26 @@ func main() {
 	}
 }
 
+// parseUnlockTime parses and validates an unlock timestamp.
+// Accepts only RFC3339 format.
+// Rejects past timestamps.
+// Returns time normalized to UTC.
+func parseUnlockTime(s string) (time.Time, error) {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid time format, expected RFC3339")
+	}
+
+	t = t.UTC()
+	now := time.Now().UTC()
+
+	if !t.After(now) {
+		return time.Time{}, fmt.Errorf("unlock time must be in the future")
+	}
+
+	return t, nil
+}
+
 func handleLock(args []string) {
 	lockFlags := flag.NewFlagSet("lock", flag.ExitOnError)
 	until := lockFlags.String("until", "", "RFC3339 timestamp for unlock time")
@@ -63,18 +83,13 @@ func handleLock(args []string) {
 		os.Exit(1)
 	}
 
-	unlockTime, err := time.Parse(time.RFC3339, *until)
+	unlockTime, err := parseUnlockTime(*until)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: invalid time format: %v\n", err)
-		fmt.Fprintln(os.Stderr, "expected RFC3339 format (e.g., 2026-02-01T15:04:05Z)")
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 
-	now := time.Now()
-	if !unlockTime.After(now) {
-		fmt.Fprintln(os.Stderr, "error: unlock time must be in the future")
-		os.Exit(1)
-	}
+	_ = unlockTime // validated but not yet used in stub implementation
 
 	var inputPath string
 	remaining := lockFlags.Args()
