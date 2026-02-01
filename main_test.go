@@ -2137,116 +2137,25 @@ func TestCreateSealedItem_WithDrandAuthority(t *testing.T) {
 		t.Errorf("expected state 'sealed', got %s", meta.State)
 	}
 
-	// Verify DEKWrap exists for drand authority
-	if meta.DEKWrap == nil {
-		t.Error("DEKWrap should exist for drand authority")
-	} else {
-		if meta.DEKWrap.Alg != "drand-hkdf-aes-256-gcm" {
-			t.Errorf("expected alg 'drand-hkdf-aes-256-gcm', got %s", meta.DEKWrap.Alg)
-		}
-
-		if meta.DEKWrap.TargetRound == 0 {
-			t.Error("target round should not be zero")
-		}
-
-		if meta.DEKWrap.WrappedDEK != nil {
-			t.Error("wrapped_dek should be null at seal time")
-		}
-
-		if meta.DEKWrap.WrapNonce != nil {
-			t.Error("wrap_nonce should be null at seal time")
-		}
+	// Verify tlock-encrypted DEK exists for drand authority
+	if meta.DEKTlockB64 == "" {
+		t.Error("dek_tlock_b64 should not be empty for drand authority")
 	}
 
-	// Verify dek.bin exists for drand authority
+	// Verify tlock ciphertext is valid base64
+	_, err = base64.StdEncoding.DecodeString(meta.DEKTlockB64)
+	if err != nil {
+		t.Fatalf("dek_tlock_b64 should be valid base64: %v", err)
+	}
+
+	// Verify dek.bin does NOT exist (security fix)
 	dekPath := filepath.Join(baseDir, id, "dek.bin")
-	dekData, err := os.ReadFile(dekPath)
-	if err != nil {
-		t.Fatalf("dek.bin should exist for drand authority: %v", err)
-	}
-
-	if len(dekData) != 32 {
-		t.Errorf("DEK should be 32 bytes, got %d", len(dekData))
+	if _, err := os.Stat(dekPath); !os.IsNotExist(err) {
+		t.Error("dek.bin should NOT exist (security fix)")
 	}
 }
 
-func TestWrapUnwrapDEK_RoundTrip(t *testing.T) {
-	dek := make([]byte, 32)
-	for i := range dek {
-		dek[i] = byte(i)
-	}
-
-	kek := make([]byte, 32)
-	for i := range kek {
-		kek[i] = byte(i + 100)
-	}
-
-	// Wrap DEK
-	wrappedDEKB64, wrapNonceB64, err := wrapDEK(dek, kek)
-	if err != nil {
-		t.Fatalf("wrapDEK failed: %v", err)
-	}
-
-	// Unwrap DEK
-	unwrappedDEK, err := unwrapDEK(wrappedDEKB64, wrapNonceB64, kek)
-	if err != nil {
-		t.Fatalf("unwrapDEK failed: %v", err)
-	}
-
-	// Verify round-trip
-	if !bytes.Equal(dek, unwrappedDEK) {
-		t.Errorf("DEK mismatch after round-trip")
-	}
-}
-
-func TestDeriveKEK_Deterministic(t *testing.T) {
-	randomness := []byte("test-randomness-bytes-for-kek-derivation")
-	itemID := "test-item-id-123"
-
-	// Derive KEK twice
-	kek1, err := deriveKEK(randomness, itemID)
-	if err != nil {
-		t.Fatalf("deriveKEK failed: %v", err)
-	}
-
-	kek2, err := deriveKEK(randomness, itemID)
-	if err != nil {
-		t.Fatalf("deriveKEK failed: %v", err)
-	}
-
-	// Should be identical (deterministic)
-	if !bytes.Equal(kek1, kek2) {
-		t.Error("KEK derivation should be deterministic")
-	}
-
-	// Should be 32 bytes
-	if len(kek1) != 32 {
-		t.Errorf("expected KEK size 32, got %d", len(kek1))
-	}
-}
-
-func TestDeriveKEK_DifferentInputs(t *testing.T) {
-	randomness1 := []byte("randomness-1")
-	randomness2 := []byte("randomness-2")
-	itemID1 := "item-1"
-	itemID2 := "item-2"
-
-	kek1, _ := deriveKEK(randomness1, itemID1)
-	kek2, _ := deriveKEK(randomness2, itemID1)
-	kek3, _ := deriveKEK(randomness1, itemID2)
-
-	// Different randomness -> different KEK
-	if bytes.Equal(kek1, kek2) {
-		t.Error("different randomness should produce different KEKs")
-	}
-
-	// Different item ID -> different KEK
-	if bytes.Equal(kek1, kek3) {
-		t.Error("different item IDs should produce different KEKs")
-	}
-}
-
-func TestCreateSealedItem_DrandAuthority_InitializesDEKWrap(t *testing.T) {
+func TestCreateSealedItem_DrandAuthority_UsesTlock(t *testing.T) {
 	tmpDir := t.TempDir()
 	oldHome := os.Getenv("HOME")
 	oldXDGDataHome := os.Getenv("XDG_DATA_HOME")
@@ -2280,27 +2189,21 @@ func TestCreateSealedItem_DrandAuthority_InitializesDEKWrap(t *testing.T) {
 		t.Fatalf("failed to unmarshal metadata: %v", err)
 	}
 
-	// Verify DEKWrap is initialized
-	if meta.DEKWrap == nil {
-		t.Fatal("DEKWrap should be initialized for drand authority")
+	// Verify tlock-encrypted DEK exists
+	if meta.DEKTlockB64 == "" {
+		t.Error("dek_tlock_b64 should not be empty for drand authority")
 	}
 
-	if meta.DEKWrap.Alg != "drand-hkdf-aes-256-gcm" {
-		t.Errorf("expected alg 'drand-hkdf-aes-256-gcm', got %s", meta.DEKWrap.Alg)
+	// Verify tlock ciphertext is valid base64
+	_, err = base64.StdEncoding.DecodeString(meta.DEKTlockB64)
+	if err != nil {
+		t.Fatalf("dek_tlock_b64 should be valid base64: %v", err)
 	}
 
-	if meta.DEKWrap.WrappedDEK != nil {
-		t.Error("wrapped_dek should be null at seal time")
-	}
-
-	if meta.DEKWrap.WrapNonce != nil {
-		t.Error("wrap_nonce should be null at seal time")
-	}
-
-	// Verify dek.bin exists
+	// Verify dek.bin does NOT exist (security fix)
 	dekPath := filepath.Join(baseDir, id, "dek.bin")
-	if _, err := os.Stat(dekPath); os.IsNotExist(err) {
-		t.Error("dek.bin should exist for drand authority")
+	if _, err := os.Stat(dekPath); !os.IsNotExist(err) {
+		t.Error("dek.bin should NOT exist (security fix)")
 	}
 }
 
