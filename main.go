@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -54,12 +55,13 @@ const usageText = `seal - irreversible time-locked commitment primitive
 
 Usage:
   seal lock <path> --until <time> [--shred]
-  seal lock --until <time>          (reads from stdin)
+  seal lock --until <time> [--clear-clipboard]  (reads from stdin)
   seal status
 
 Options:
-  --until <time>    RFC3339 timestamp for unlock time
-  --shred           best-effort file shredding (file input only)
+  --until <time>         RFC3339 timestamp for unlock time
+  --shred                best-effort file shredding (file input only)
+  --clear-clipboard      best-effort clipboard clearing (stdin only)
 
 seal lock encrypts data until a specified future time.
 seal status shows information about sealed commitments.
@@ -280,6 +282,48 @@ func shredFile(path string) []string {
 	return warnings
 }
 
+// clearClipboard performs best-effort clipboard clearing.
+// Overwrites the system clipboard with an empty string.
+// Returns a slice of warnings encountered (does not fail on errors).
+func clearClipboard() []string {
+	var warnings []string
+
+	// On macOS, use pbcopy
+	if runtime.GOOS == "darwin" {
+		cmd := exec.Command("pbcopy")
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("warning: failed to access clipboard: %v", err))
+			return warnings
+		}
+
+		if err := cmd.Start(); err != nil {
+			warnings = append(warnings, fmt.Sprintf("warning: failed to start clipboard clear: %v", err))
+			return warnings
+		}
+
+		// Write empty string to clipboard
+		if _, err := stdin.Write([]byte("")); err != nil {
+			warnings = append(warnings, fmt.Sprintf("warning: failed to write to clipboard: %v", err))
+			stdin.Close()
+			cmd.Wait()
+			return warnings
+		}
+
+		stdin.Close()
+
+		if err := cmd.Wait(); err != nil {
+			warnings = append(warnings, fmt.Sprintf("warning: clipboard clear command failed: %v", err))
+			return warnings
+		}
+	} else {
+		// On other platforms, we don't attempt to clear
+		warnings = append(warnings, "warning: clipboard clearing not implemented for this platform")
+	}
+
+	return warnings
+}
+
 // getSealBaseDir returns the OS-appropriate base directory for Seal data.
 func getSealBaseDir() (string, error) {
 	var baseDir string
@@ -428,10 +472,11 @@ func handleLock(args []string) {
 	lockFlags := flag.NewFlagSet("lock", flag.ExitOnError)
 	until := lockFlags.String("until", "", "RFC3339 timestamp for unlock time")
 	shred := lockFlags.Bool("shred", false, "best-effort file shredding (file input only)")
+	clearClip := lockFlags.Bool("clear-clipboard", false, "best-effort clipboard clearing (stdin only)")
 
 	lockFlags.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: seal lock <path> --until <time> [--shred]")
-		fmt.Fprintln(os.Stderr, "       seal lock --until <time>  (reads from stdin)")
+		fmt.Fprintln(os.Stderr, "       seal lock --until <time> [--clear-clipboard]  (reads from stdin)")
 		lockFlags.PrintDefaults()
 	}
 
@@ -468,6 +513,12 @@ func handleLock(args []string) {
 		os.Exit(1)
 	}
 
+	// Validate --clear-clipboard usage
+	if *clearClip && inputPath != "" {
+		fmt.Fprintln(os.Stderr, "error: --clear-clipboard can only be used with stdin input")
+		os.Exit(1)
+	}
+
 	inputData, inputSrc, err := readInput(inputPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -476,8 +527,12 @@ func handleLock(args []string) {
 
 	// Print mandatory warning if shredding
 	if *shred {
-		fmt.Fprintln(os.Stderr, "warning: file shredding on modern filesystems is best-effort only.")
-		fmt.Fprintln(os.Stderr, "backups, snapshots, wear leveling, and caches may retain data.")
+		fmt.Fprintln(os.Stderr, "warning: file shredding on modern filesystems is best-effort only. backups, snapshots, wear leveling, and caches may retain data.")
+	}
+
+	// Print mandatory warning if clearing clipboard
+	if *clearClip {
+		fmt.Fprintln(os.Stderr, "warning: clipboard clearing is best-effort; the OS or other apps may retain copies")
 	}
 
 	// Create sealed item with encrypted payload
@@ -490,6 +545,14 @@ func handleLock(args []string) {
 	// Shred original file if requested (best-effort, after successful sealing)
 	if *shred && inputPath != "" {
 		warnings := shredFile(inputPath)
+		for _, warning := range warnings {
+			fmt.Fprintln(os.Stderr, warning)
+		}
+	}
+
+	// Clear clipboard if requested (best-effort, after successful sealing)
+	if *clearClip && inputPath == "" {
+		warnings := clearClipboard()
 		for _, warning := range warnings {
 			fmt.Fprintln(os.Stderr, warning)
 		}

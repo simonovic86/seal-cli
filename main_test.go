@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -1287,12 +1288,8 @@ func TestLockCommand_Shred_Success(t *testing.T) {
 
 	// Stderr should contain the mandatory warning
 	stderrStr := stderr.String()
-	if !strings.Contains(stderrStr, "warning: file shredding on modern filesystems is best-effort only.") {
+	if !strings.Contains(stderrStr, "warning: file shredding on modern filesystems is best-effort only. backups, snapshots, wear leveling, and caches may retain data.") {
 		t.Errorf("stderr should contain shredding warning, got: %q", stderrStr)
-	}
-
-	if !strings.Contains(stderrStr, "backups, snapshots, wear leveling, and caches may retain data.") {
-		t.Errorf("stderr should contain complete shredding warning, got: %q", stderrStr)
 	}
 
 	// Original file should be removed
@@ -1344,12 +1341,12 @@ func TestLockCommand_Shred_FailureDoesNotAbortSealing(t *testing.T) {
 
 	// Stderr should contain both the mandatory warning and shredding failure warning
 	stderrStr := stderr.String()
-	if !strings.Contains(stderrStr, "warning: file shredding on modern filesystems is best-effort only.") {
+	if !strings.Contains(stderrStr, "warning: file shredding on modern filesystems is best-effort only. backups, snapshots, wear leveling, and caches may retain data.") {
 		t.Errorf("stderr should contain mandatory warning, got: %q", stderrStr)
 	}
 
-	if !strings.Contains(stderrStr, "warning:") {
-		t.Errorf("stderr should contain shredding failure warning, got: %q", stderrStr)
+	if strings.Count(stderrStr, "warning:") < 2 {
+		t.Errorf("stderr should contain both mandatory warning and shredding failure warning, got: %q", stderrStr)
 	}
 
 	// Clean up - restore write permissions and remove file
@@ -1422,13 +1419,188 @@ func TestLockCommand_Shred_WarningNotSuppressible(t *testing.T) {
 	stderrStr := stderr.String()
 
 	// Warning must always appear when --shred is used
-	if !strings.Contains(stderrStr, "warning: file shredding on modern filesystems is best-effort only.") {
+	expectedWarning := "warning: file shredding on modern filesystems is best-effort only. backups, snapshots, wear leveling, and caches may retain data."
+	if !strings.Contains(stderrStr, expectedWarning) {
 		t.Error("mandatory warning must appear when --shred is used")
 	}
 
 	// Verify it appears exactly once (not multiple times)
-	warningCount := strings.Count(stderrStr, "warning: file shredding on modern filesystems is best-effort only.")
+	warningCount := strings.Count(stderrStr, expectedWarning)
 	if warningCount != 1 {
 		t.Errorf("warning should appear exactly once, appeared %d times", warningCount)
+	}
+}
+
+func TestClearClipboard_BestEffort(t *testing.T) {
+	// Test that clearClipboard doesn't panic and returns warnings on unsupported platforms
+	warnings := clearClipboard()
+
+	// On macOS, it may succeed (no warnings) or fail (warnings)
+	// On other platforms, it should warn about not being implemented
+	// Either way, it should not panic
+	if runtime.GOOS != "darwin" && len(warnings) == 0 {
+		t.Error("expected warning on non-macOS platform")
+	}
+
+	// All warnings should start with "warning:"
+	for _, warning := range warnings {
+		if !strings.HasPrefix(warning, "warning:") {
+			t.Errorf("warning should start with 'warning:', got: %q", warning)
+		}
+	}
+}
+
+func TestLockCommand_ClearClipboard_Success(t *testing.T) {
+	binPath := filepath.Join(t.TempDir(), "seal-test")
+	buildCmd := exec.Command("go", "build", "-o", binPath)
+	if output, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to build binary: %v\n%s", err, output)
+	}
+
+	tmpHome := t.TempDir()
+
+	// Run seal lock with --clear-clipboard from stdin
+	cmd := exec.Command(binPath, "lock", "--until", "2027-12-31T23:59:59Z", "--clear-clipboard")
+	cmd.Stdin = strings.NewReader("secret content to seal")
+	cmd.Env = append(os.Environ(), "HOME="+tmpHome, "XDG_DATA_HOME=")
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("seal lock failed: %v\nstderr: %s", err, stderr.String())
+	}
+
+	// Stdout should contain only ID
+	stdoutStr := stdout.String()
+	stdoutTrimmed := strings.TrimSpace(stdoutStr)
+	uuidRegex := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	if !uuidRegex.MatchString(stdoutTrimmed) {
+		t.Errorf("stdout should contain only UUID, got: %q", stdoutStr)
+	}
+
+	// Stderr should contain the mandatory warning
+	stderrStr := stderr.String()
+	expectedWarning := "warning: clipboard clearing is best-effort; the OS or other apps may retain copies"
+	if !strings.Contains(stderrStr, expectedWarning) {
+		t.Errorf("stderr should contain clipboard warning, got: %q", stderrStr)
+	}
+}
+
+func TestLockCommand_ClearClipboard_ErrorWithFile(t *testing.T) {
+	binPath := filepath.Join(t.TempDir(), "seal-test")
+	buildCmd := exec.Command("go", "build", "-o", binPath)
+	if output, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to build binary: %v\n%s", err, output)
+	}
+
+	tmpHome := t.TempDir()
+	testFile := filepath.Join(tmpHome, "test.txt")
+
+	if err := os.WriteFile(testFile, []byte("test content"), 0600); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	// Run seal lock with --clear-clipboard on file input (should error)
+	cmd := exec.Command(binPath, "lock", "--until", "2027-12-31T23:59:59Z", "--clear-clipboard", testFile)
+	cmd.Env = append(os.Environ(), "HOME="+tmpHome, "XDG_DATA_HOME=")
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	// Should fail with error
+	err := cmd.Run()
+	if err == nil {
+		t.Fatal("seal lock with --clear-clipboard and file input should fail")
+	}
+
+	// Stdout should be empty
+	if stdout.String() != "" {
+		t.Errorf("stdout should be empty on error, got: %q", stdout.String())
+	}
+
+	// Stderr should contain the error
+	stderrStr := stderr.String()
+	if !strings.Contains(stderrStr, "error: --clear-clipboard can only be used with stdin input") {
+		t.Errorf("stderr should contain clear-clipboard+file error, got: %q", stderrStr)
+	}
+}
+
+func TestLockCommand_ClearClipboard_WarningNotSuppressible(t *testing.T) {
+	binPath := filepath.Join(t.TempDir(), "seal-test")
+	buildCmd := exec.Command("go", "build", "-o", binPath)
+	if output, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to build binary: %v\n%s", err, output)
+	}
+
+	tmpHome := t.TempDir()
+
+	// Run with --clear-clipboard - warning must appear
+	cmd := exec.Command(binPath, "lock", "--until", "2027-12-31T23:59:59Z", "--clear-clipboard")
+	cmd.Stdin = strings.NewReader("test content")
+	cmd.Env = append(os.Environ(), "HOME="+tmpHome, "XDG_DATA_HOME=")
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("seal lock failed: %v\nstderr: %s", err, stderr.String())
+	}
+
+	stderrStr := stderr.String()
+
+	// Warning must always appear when --clear-clipboard is used
+	expectedWarning := "warning: clipboard clearing is best-effort; the OS or other apps may retain copies"
+	if !strings.Contains(stderrStr, expectedWarning) {
+		t.Error("mandatory warning must appear when --clear-clipboard is used")
+	}
+
+	// Verify it appears exactly once (not multiple times)
+	warningCount := strings.Count(stderrStr, expectedWarning)
+	if warningCount != 1 {
+		t.Errorf("warning should appear exactly once, appeared %d times", warningCount)
+	}
+}
+
+func TestLockCommand_ClearClipboard_FailureDoesNotAbortSealing(t *testing.T) {
+	binPath := filepath.Join(t.TempDir(), "seal-test")
+	buildCmd := exec.Command("go", "build", "-o", binPath)
+	if output, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to build binary: %v\n%s", err, output)
+	}
+
+	tmpHome := t.TempDir()
+
+	// Run seal lock with --clear-clipboard
+	// Even if clipboard clearing fails (e.g., on unsupported platform), sealing should succeed
+	cmd := exec.Command(binPath, "lock", "--until", "2027-12-31T23:59:59Z", "--clear-clipboard")
+	cmd.Stdin = strings.NewReader("test data")
+	cmd.Env = append(os.Environ(), "HOME="+tmpHome, "XDG_DATA_HOME=")
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	// Should succeed even if clipboard clearing fails
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("seal lock should succeed even if clipboard clearing fails: %v\nstderr: %s", err, stderr.String())
+	}
+
+	// Stdout should still contain the sealed item ID
+	stdoutStr := stdout.String()
+	stdoutTrimmed := strings.TrimSpace(stdoutStr)
+	uuidRegex := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	if !uuidRegex.MatchString(stdoutTrimmed) {
+		t.Errorf("stdout should contain UUID even on clipboard clear failure, got: %q", stdoutStr)
+	}
+
+	// Stderr should contain the mandatory warning
+	stderrStr := stderr.String()
+	expectedWarning := "warning: clipboard clearing is best-effort; the OS or other apps may retain copies"
+	if !strings.Contains(stderrStr, expectedWarning) {
+		t.Errorf("stderr should contain mandatory warning, got: %q", stderrStr)
 	}
 }
