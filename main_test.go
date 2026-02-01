@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -411,5 +412,288 @@ func TestReadInput_FileDoesNotExist(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "cannot open file") {
 		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestGetSealBaseDir_PlatformAgnostic(t *testing.T) {
+	// Test with temp directory to avoid polluting actual user directories
+	// We'll test the logic indirectly by overriding environment variables
+	
+	// Save original environment
+	oldHome := os.Getenv("HOME")
+	oldAppData := os.Getenv("AppData")
+	oldXDGDataHome := os.Getenv("XDG_DATA_HOME")
+	
+	defer func() {
+		os.Setenv("HOME", oldHome)
+		os.Setenv("AppData", oldAppData)
+		os.Setenv("XDG_DATA_HOME", oldXDGDataHome)
+	}()
+
+	baseDir, err := getSealBaseDir()
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	// Verify it ends with "seal"
+	if filepath.Base(baseDir) != "seal" {
+		t.Errorf("expected base dir to end with 'seal', got: %s", baseDir)
+	}
+
+	// Verify it's an absolute path
+	if !filepath.IsAbs(baseDir) {
+		t.Errorf("expected absolute path, got: %s", baseDir)
+	}
+}
+
+func TestCreateSealedItem_And_List(t *testing.T) {
+	// Override base directory for testing
+	tmpDir := t.TempDir()
+	
+	// Save original HOME and set temporary one
+	oldHome := os.Getenv("HOME")
+	oldXDGDataHome := os.Getenv("XDG_DATA_HOME")
+	defer func() {
+		os.Setenv("HOME", oldHome)
+		os.Setenv("XDG_DATA_HOME", oldXDGDataHome)
+	}()
+
+	os.Setenv("HOME", tmpDir)
+	os.Setenv("XDG_DATA_HOME", "")
+
+	unlockTime := time.Now().UTC().Add(24 * time.Hour)
+	testPayload := []byte("test sealed content")
+	testPath := "/test/path.txt"
+
+	// Create sealed item
+	id, err := createSealedItem(unlockTime, inputSourceFile, testPath, testPayload)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if id == "" {
+		t.Fatal("expected non-empty ID")
+	}
+
+	// Verify directory structure
+	baseDir, _ := getSealBaseDir()
+	itemDir := filepath.Join(baseDir, id)
+
+	// Check item directory exists
+	if _, err := os.Stat(itemDir); os.IsNotExist(err) {
+		t.Fatalf("item directory does not exist: %s", itemDir)
+	}
+
+	// Check meta.json exists and is valid
+	metaPath := filepath.Join(itemDir, "meta.json")
+	metaData, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("cannot read meta.json: %v", err)
+	}
+
+	var meta SealedItem
+	if err := json.Unmarshal(metaData, &meta); err != nil {
+		t.Fatalf("cannot unmarshal meta.json: %v", err)
+	}
+
+	// Verify metadata fields
+	if meta.ID != id {
+		t.Errorf("ID mismatch: got %s, want %s", meta.ID, id)
+	}
+
+	if !meta.UnlockTime.Equal(unlockTime) {
+		t.Errorf("UnlockTime mismatch: got %v, want %v", meta.UnlockTime, unlockTime)
+	}
+
+	if meta.InputType != "file" {
+		t.Errorf("InputType mismatch: got %s, want file", meta.InputType)
+	}
+
+	if meta.OriginalPath != testPath {
+		t.Errorf("OriginalPath mismatch: got %s, want %s", meta.OriginalPath, testPath)
+	}
+
+	if meta.TimeAuthority != "placeholder" {
+		t.Errorf("TimeAuthority mismatch: got %s, want placeholder", meta.TimeAuthority)
+	}
+
+	if meta.CreatedAt.IsZero() {
+		t.Error("CreatedAt should not be zero")
+	}
+
+	// Check payload.bin exists
+	payloadPath := filepath.Join(itemDir, "payload.bin")
+	payloadData, err := os.ReadFile(payloadPath)
+	if err != nil {
+		t.Fatalf("cannot read payload.bin: %v", err)
+	}
+
+	if !bytes.Equal(payloadData, testPayload) {
+		t.Errorf("payload mismatch: got %q, want %q", payloadData, testPayload)
+	}
+
+	// List sealed items
+	items, err := listSealedItems()
+	if err != nil {
+		t.Fatalf("listSealedItems failed: %v", err)
+	}
+
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+
+	if items[0].ID != id {
+		t.Errorf("listed item ID mismatch: got %s, want %s", items[0].ID, id)
+	}
+}
+
+func TestMetadata_RoundTrip(t *testing.T) {
+	// Test JSON serialization/deserialization
+	unlockTime := time.Date(2027, 3, 15, 14, 30, 0, 0, time.UTC)
+	createdAt := time.Date(2026, 2, 1, 10, 0, 0, 0, time.UTC)
+
+	original := SealedItem{
+		ID:            "test-id-123",
+		UnlockTime:    unlockTime,
+		InputType:     "stdin",
+		OriginalPath:  "",
+		TimeAuthority: "placeholder",
+		CreatedAt:     createdAt,
+	}
+
+	// Marshal to JSON
+	jsonData, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+
+	// Unmarshal back
+	var decoded SealedItem
+	if err := json.Unmarshal(jsonData, &decoded); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+
+	// Verify all fields
+	if decoded.ID != original.ID {
+		t.Errorf("ID mismatch: got %s, want %s", decoded.ID, original.ID)
+	}
+
+	if !decoded.UnlockTime.Equal(original.UnlockTime) {
+		t.Errorf("UnlockTime mismatch: got %v, want %v", decoded.UnlockTime, original.UnlockTime)
+	}
+
+	if decoded.InputType != original.InputType {
+		t.Errorf("InputType mismatch: got %s, want %s", decoded.InputType, original.InputType)
+	}
+
+	if decoded.OriginalPath != original.OriginalPath {
+		t.Errorf("OriginalPath mismatch: got %s, want %s", decoded.OriginalPath, original.OriginalPath)
+	}
+
+	if decoded.TimeAuthority != original.TimeAuthority {
+		t.Errorf("TimeAuthority mismatch: got %s, want %s", decoded.TimeAuthority, original.TimeAuthority)
+	}
+
+	if !decoded.CreatedAt.Equal(original.CreatedAt) {
+		t.Errorf("CreatedAt mismatch: got %v, want %v", decoded.CreatedAt, original.CreatedAt)
+	}
+}
+
+func TestListSealedItems_Empty(t *testing.T) {
+	// Override base directory for testing
+	tmpDir := t.TempDir()
+	
+	oldHome := os.Getenv("HOME")
+	oldXDGDataHome := os.Getenv("XDG_DATA_HOME")
+	defer func() {
+		os.Setenv("HOME", oldHome)
+		os.Setenv("XDG_DATA_HOME", oldXDGDataHome)
+	}()
+
+	os.Setenv("HOME", tmpDir)
+	os.Setenv("XDG_DATA_HOME", "")
+
+	items, err := listSealedItems()
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if len(items) != 0 {
+		t.Errorf("expected 0 items, got %d", len(items))
+	}
+}
+
+func TestListSealedItems_MultipleSorted(t *testing.T) {
+	// Override base directory for testing
+	tmpDir := t.TempDir()
+	
+	oldHome := os.Getenv("HOME")
+	oldXDGDataHome := os.Getenv("XDG_DATA_HOME")
+	defer func() {
+		os.Setenv("HOME", oldHome)
+		os.Setenv("XDG_DATA_HOME", oldXDGDataHome)
+	}()
+
+	os.Setenv("HOME", tmpDir)
+	os.Setenv("XDG_DATA_HOME", "")
+
+	unlockTime := time.Now().UTC().Add(24 * time.Hour)
+	
+	// Create multiple items with slight delays to ensure different creation times
+	var ids []string
+	for i := 0; i < 3; i++ {
+		id, err := createSealedItem(
+			unlockTime.Add(time.Duration(i)*time.Hour),
+			inputSourceStdin,
+			"",
+			[]byte("test content "+string(rune('A'+i))),
+		)
+		if err != nil {
+			t.Fatalf("failed to create item %d: %v", i, err)
+		}
+		ids = append(ids, id)
+		
+		// Small delay to ensure different creation timestamps
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// List items
+	items, err := listSealedItems()
+	if err != nil {
+		t.Fatalf("listSealedItems failed: %v", err)
+	}
+
+	if len(items) != 3 {
+		t.Fatalf("expected 3 items, got %d", len(items))
+	}
+
+	// Verify items are sorted by creation time (oldest first)
+	for i := 0; i < len(items)-1; i++ {
+		if items[i].CreatedAt.After(items[i+1].CreatedAt) {
+			t.Errorf("items not sorted: item %d created at %v is after item %d created at %v",
+				i, items[i].CreatedAt, i+1, items[i+1].CreatedAt)
+		}
+	}
+
+	// Verify all IDs are present
+	foundIDs := make(map[string]bool)
+	for _, item := range items {
+		foundIDs[item.ID] = true
+	}
+
+	for _, id := range ids {
+		if !foundIDs[id] {
+			t.Errorf("ID %s not found in listed items", id)
+		}
+	}
+}
+
+func TestInputSource_String(t *testing.T) {
+	if inputSourceFile.String() != "file" {
+		t.Errorf("expected 'file', got %s", inputSourceFile.String())
+	}
+
+	if inputSourceStdin.String() != "stdin" {
+		t.Errorf("expected 'stdin', got %s", inputSourceStdin.String())
 	}
 }

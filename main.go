@@ -1,12 +1,18 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const (
@@ -19,6 +25,23 @@ const (
 	inputSourceFile inputSource = iota
 	inputSourceStdin
 )
+
+func (i inputSource) String() string {
+	if i == inputSourceFile {
+		return "file"
+	}
+	return "stdin"
+}
+
+// SealedItem represents metadata for a sealed item.
+type SealedItem struct {
+	ID              string    `json:"id"`
+	UnlockTime      time.Time `json:"unlock_time"`
+	InputType       string    `json:"input_type"`
+	OriginalPath    string    `json:"original_path,omitempty"`
+	TimeAuthority   string    `json:"time_authority"`
+	CreatedAt       time.Time `json:"created_at"`
+}
 
 const usageText = `seal - irreversible time-locked commitment primitive
 
@@ -149,6 +172,140 @@ func readInput(path string) ([]byte, inputSource, error) {
 	return data, source, nil
 }
 
+// getSealBaseDir returns the OS-appropriate base directory for Seal data.
+func getSealBaseDir() (string, error) {
+	var baseDir string
+
+	switch runtime.GOOS {
+	case "darwin":
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("cannot get home directory: %w", err)
+		}
+		baseDir = filepath.Join(home, "Library", "Application Support", "seal")
+
+	case "windows":
+		appData := os.Getenv("AppData")
+		if appData == "" {
+			return "", errors.New("AppData environment variable not set")
+		}
+		baseDir = filepath.Join(appData, "seal")
+
+	default: // Linux and other Unix-like systems
+		xdgDataHome := os.Getenv("XDG_DATA_HOME")
+		if xdgDataHome != "" {
+			baseDir = filepath.Join(xdgDataHome, "seal")
+		} else {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return "", fmt.Errorf("cannot get home directory: %w", err)
+			}
+			baseDir = filepath.Join(home, ".local", "share", "seal")
+		}
+	}
+
+	return baseDir, nil
+}
+
+// createSealedItem creates a new sealed item on disk.
+// Returns the item ID and error.
+func createSealedItem(unlockTime time.Time, inputType inputSource, originalPath string, payload []byte) (string, error) {
+	baseDir, err := getSealBaseDir()
+	if err != nil {
+		return "", err
+	}
+
+	// Create base directory if it doesn't exist
+	if err := os.MkdirAll(baseDir, 0700); err != nil {
+		return "", fmt.Errorf("cannot create seal directory: %w", err)
+	}
+
+	// Generate UUID for this sealed item
+	id := uuid.New().String()
+	itemDir := filepath.Join(baseDir, id)
+
+	// Create item directory
+	if err := os.Mkdir(itemDir, 0700); err != nil {
+		return "", fmt.Errorf("cannot create item directory: %w", err)
+	}
+
+	// Create metadata
+	meta := SealedItem{
+		ID:            id,
+		UnlockTime:    unlockTime.UTC(),
+		InputType:     inputType.String(),
+		OriginalPath:  originalPath,
+		TimeAuthority: "placeholder", // TODO: implement time authority
+		CreatedAt:     time.Now().UTC(),
+	}
+
+	// Write metadata
+	metaPath := filepath.Join(itemDir, "meta.json")
+	metaJSON, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("cannot marshal metadata: %w", err)
+	}
+
+	if err := os.WriteFile(metaPath, metaJSON, 0600); err != nil {
+		return "", fmt.Errorf("cannot write metadata: %w", err)
+	}
+
+	// Write payload (encrypted placeholder for now)
+	payloadPath := filepath.Join(itemDir, "payload.bin")
+	if err := os.WriteFile(payloadPath, payload, 0600); err != nil {
+		return "", fmt.Errorf("cannot write payload: %w", err)
+	}
+
+	return id, nil
+}
+
+// listSealedItems returns all sealed items, sorted by creation time (oldest first).
+func listSealedItems() ([]SealedItem, error) {
+	baseDir, err := getSealBaseDir()
+	if err != nil {
+		return nil, err
+	}
+
+	// Check if base directory exists
+	if _, err := os.Stat(baseDir); os.IsNotExist(err) {
+		return []SealedItem{}, nil // No items yet
+	}
+
+	entries, err := os.ReadDir(baseDir)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read seal directory: %w", err)
+	}
+
+	var items []SealedItem
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		metaPath := filepath.Join(baseDir, entry.Name(), "meta.json")
+		metaData, err := os.ReadFile(metaPath)
+		if err != nil {
+			// Skip invalid items
+			continue
+		}
+
+		var item SealedItem
+		if err := json.Unmarshal(metaData, &item); err != nil {
+			// Skip invalid items
+			continue
+		}
+
+		items = append(items, item)
+	}
+
+	// Sort by creation time (oldest first)
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].CreatedAt.Before(items[j].CreatedAt)
+	})
+
+	return items, nil
+}
+
 func handleLock(args []string) {
 	lockFlags := flag.NewFlagSet("lock", flag.ExitOnError)
 	until := lockFlags.String("until", "", "RFC3339 timestamp for unlock time")
@@ -192,12 +349,15 @@ func handleLock(args []string) {
 		os.Exit(1)
 	}
 
-	_ = unlockTime // validated but not yet used in stub implementation
-	_ = inputData  // read but not yet encrypted in stub implementation
-	_ = inputSrc   // tracked but not yet used in stub implementation
+	// Create sealed item (payload is unencrypted placeholder for now)
+	id, err := createSealedItem(unlockTime, inputSrc, inputPath, inputData)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
 
-	fmt.Fprintln(os.Stderr, "error: lock not implemented")
-	os.Exit(1)
+	fmt.Println(id)
+	os.Exit(0)
 }
 
 func handleStatus(args []string) {
@@ -214,6 +374,20 @@ func handleStatus(args []string) {
 		os.Exit(1)
 	}
 
-	fmt.Fprintln(os.Stderr, "error: status not implemented")
-	os.Exit(1)
+	items, err := listSealedItems()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(items) == 0 {
+		fmt.Println("no sealed items")
+		os.Exit(0)
+	}
+
+	for _, item := range items {
+		fmt.Printf("%s %s %s\n", item.ID, item.UnlockTime.Format(time.RFC3339), item.InputType)
+	}
+
+	os.Exit(0)
 }
