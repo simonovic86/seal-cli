@@ -10,6 +10,8 @@ type StatusResult struct {
 	Items                  []SealedItem
 	MaterializationFailed  bool
 	FirstError             error
+	ValidationFailed       bool
+	ValidationErrors       []error
 }
 
 // GetStatus retrieves all sealed items and attempts materialization.
@@ -28,13 +30,23 @@ func GetStatus() (StatusResult, error) {
 		return StatusResult{}, err
 	}
 
-	// Track materialization errors
+	// Track materialization and validation errors
 	var materializationFailed bool
 	var firstError error
+	var validationFailed bool
+	var validationErrors []error
 
-	// Attempt materialization for each item, then report post-materialization state
+	// Validate and materialize each item
 	for i := range items {
 		itemDir := filepath.Join(baseDir, items[i].ID)
+		
+		// Validate item state invariants after loading
+		if err := ValidateItemState(items[i], itemDir); err != nil {
+			validationFailed = true
+			validationErrors = append(validationErrors, err)
+			// Continue processing other items
+			continue
+		}
 		
 		// Attempt materialization (idempotent - no-op if already unlocked)
 		// CheckAndTransitionUnlock handles metadata persistence via saveMetadata
@@ -56,6 +68,8 @@ func GetStatus() (StatusResult, error) {
 		Items:                 items,
 		MaterializationFailed: materializationFailed,
 		FirstError:            firstError,
+		ValidationFailed:      validationFailed,
+		ValidationErrors:      validationErrors,
 	}, nil
 }
 

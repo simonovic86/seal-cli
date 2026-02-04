@@ -130,6 +130,12 @@ func TryMaterialize(item SealedItem, itemDir string, authority timeauth.TimeAuth
 		return item, err
 	}
 
+	// Validate post-materialization invariants
+	// This should never fail - if it does, it's a fatal internal error
+	if err := ValidateItemState(item, itemDir); err != nil {
+		return item, fmt.Errorf("internal error: post-materialization validation failed: %w", err)
+	}
+
 	return item, nil
 }
 

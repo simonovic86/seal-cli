@@ -145,13 +145,22 @@ func handleStatus(args []string) {
 		os.Exit(1)
 	}
 
+	// Print validation errors to stderr
+	if result.ValidationFailed {
+		for _, validationErr := range result.ValidationErrors {
+			fmt.Fprintf(os.Stderr, "error: %v\n", validationErr)
+		}
+	}
+
 	// Print status output
 	output := seal.FormatStatusOutput(result.Items)
 	fmt.Print(output)
 
-	// Exit with error if any materialization failed
-	if result.MaterializationFailed {
-		fmt.Fprintf(os.Stderr, "error: materialization failed: %v\n", result.FirstError)
+	// Exit with error if any validation or materialization failed
+	if result.ValidationFailed || result.MaterializationFailed {
+		if result.MaterializationFailed {
+			fmt.Fprintf(os.Stderr, "error: materialization failed: %v\n", result.FirstError)
+		}
 		os.Exit(1)
 	}
 
