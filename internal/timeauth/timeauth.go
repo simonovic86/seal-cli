@@ -2,6 +2,8 @@ package timeauth
 
 import (
 	"bytes"
+	"context"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -11,11 +13,7 @@ import (
 
 	"github.com/drand/tlock"
 	thttp "github.com/drand/tlock/networks/http"
-	"encoding/base64"
 )
-
-// KeyReference is an opaque reference to a time-locked encryption key.
-type KeyReference string
 
 // TimeAuthority is an external, verifiable source of truth for time-based unlocking.
 type TimeAuthority interface {
@@ -32,19 +30,45 @@ type TimeAuthority interface {
 }
 
 // PlaceholderAuthority is a no-op time authority for testing and development.
-// It never permits unlocking.
+// It never permits unlocking and does not support time-lock encryption.
 type PlaceholderAuthority struct{}
 
 func (p *PlaceholderAuthority) Name() string {
 	return "placeholder"
 }
 
+func (p *PlaceholderAuthority) RoundAt(unlockTime time.Time) (uint64, error) {
+	// Placeholder doesn't use rounds
+	return 0, nil
+}
+
+func (p *PlaceholderAuthority) TimeLockEncrypt(data []byte, targetRound uint64) (string, error) {
+	// Placeholder doesn't support time-lock encryption
+	// Return empty string to indicate no tlock support (preserves old behavior)
+	return "", nil
+}
+
+func (p *PlaceholderAuthority) TimeLockDecrypt(ctx context.Context, ciphertextB64 string) ([]byte, error) {
+	// Placeholder doesn't support time-lock decryption
+	// This should never be called since items without DEKTlockB64 don't materialize
+	return nil, fmt.Errorf("placeholder authority does not support time-lock decryption")
+}
+
+func (p *PlaceholderAuthority) CanUnlock(ctx context.Context, targetRound uint64) (bool, error) {
+	// Always returns false - no unlocking permitted
+	return false, nil
+}
+
+// Lock creates a time-locked key reference for the given unlock time.
+// Deprecated: For backward compatibility with old tests.
 func (p *PlaceholderAuthority) Lock(unlockTime time.Time) (KeyReference, error) {
 	// Return a dummy key reference
 	return KeyReference("placeholder-key-ref"), nil
 }
 
-func (p *PlaceholderAuthority) CanUnlock(ref KeyReference, now time.Time) (bool, error) {
+// CanUnlockRef checks if unlocking is permitted for a key reference.
+// Deprecated: For backward compatibility with old tests.
+func (p *PlaceholderAuthority) CanUnlockRef(ref KeyReference, now time.Time) (bool, error) {
 	// Always returns false - no unlocking permitted
 	return false, nil
 }
@@ -100,11 +124,12 @@ func (d *DrandAuthority) Name() string {
 	return "drand"
 }
 
-func (d *DrandAuthority) Lock(unlockTime time.Time) (KeyReference, error) {
+// RoundAt calculates the drand round number for a given unlock time.
+func (d *DrandAuthority) RoundAt(unlockTime time.Time) (uint64, error) {
 	// Fetch network info to get period and genesis time
 	info, err := d.FetchInfo()
 	if err != nil {
-		return "", fmt.Errorf("failed to fetch drand info: %w", err)
+		return 0, fmt.Errorf("failed to fetch drand info: %w", err)
 	}
 
 	// Calculate target round for the unlock time
@@ -113,7 +138,7 @@ func (d *DrandAuthority) Lock(unlockTime time.Time) (KeyReference, error) {
 	elapsedSeconds := unlockUnix - info.GenesisTime
 
 	if elapsedSeconds < 0 {
-		return "", fmt.Errorf("unlock time is before drand genesis")
+		return 0, fmt.Errorf("unlock time is before drand genesis")
 	}
 
 	targetRound := uint64(elapsedSeconds) / uint64(info.Period)
@@ -121,6 +146,37 @@ func (d *DrandAuthority) Lock(unlockTime time.Time) (KeyReference, error) {
 	// Round up to ensure we're at or after the unlock time
 	if uint64(elapsedSeconds)%uint64(info.Period) != 0 {
 		targetRound++
+	}
+
+	return targetRound, nil
+}
+
+// TimeLockEncrypt encrypts data using tlock to the specified round.
+func (d *DrandAuthority) TimeLockEncrypt(data []byte, targetRound uint64) (string, error) {
+	return d.Timelock.Encrypt(data, targetRound)
+}
+
+// TimeLockDecrypt decrypts time-locked data using drand randomness.
+func (d *DrandAuthority) TimeLockDecrypt(ctx context.Context, ciphertextB64 string) ([]byte, error) {
+	return d.Timelock.Decrypt(ciphertextB64)
+}
+
+// CanUnlock checks if the target round has been reached.
+func (d *DrandAuthority) CanUnlock(ctx context.Context, targetRound uint64) (bool, error) {
+	currentRound, err := d.fetchLatestRound()
+	if err != nil {
+		return false, fmt.Errorf("failed to fetch latest round: %w", err)
+	}
+
+	return currentRound >= targetRound, nil
+}
+
+// Lock creates a time-locked key reference for the given unlock time.
+// Deprecated: Use RoundAt() for new code. Kept for backward compatibility.
+func (d *DrandAuthority) Lock(unlockTime time.Time) (KeyReference, error) {
+	targetRound, err := d.RoundAt(unlockTime)
+	if err != nil {
+		return "", err
 	}
 
 	// Create key reference
@@ -137,7 +193,9 @@ func (d *DrandAuthority) Lock(unlockTime time.Time) (KeyReference, error) {
 	return KeyReference(refJSON), nil
 }
 
-func (d *DrandAuthority) CanUnlock(ref KeyReference, now time.Time) (bool, error) {
+// CanUnlockRef checks if unlocking is permitted for a key reference.
+// Deprecated: For backward compatibility with old Lock/CanUnlock pattern.
+func (d *DrandAuthority) CanUnlockRef(ref KeyReference, now time.Time) (bool, error) {
 	// Parse key reference
 	var drandRef DrandKeyReference
 	if err := json.Unmarshal([]byte(ref), &drandRef); err != nil {
@@ -149,14 +207,8 @@ func (d *DrandAuthority) CanUnlock(ref KeyReference, now time.Time) (bool, error
 		return false, fmt.Errorf("network mismatch: expected %s, got %s", d.NetworkName, drandRef.Network)
 	}
 
-	// Fetch latest round info
-	currentRound, err := d.fetchLatestRound()
-	if err != nil {
-		return false, fmt.Errorf("failed to fetch latest round: %w", err)
-	}
-
-	// Check if current round has reached or exceeded target round
-	return currentRound >= drandRef.TargetRound, nil
+	// Use the new CanUnlock method
+	return d.CanUnlock(context.Background(), drandRef.TargetRound)
 }
 
 func (d *DrandAuthority) FetchInfo() (*DrandInfo, error) {

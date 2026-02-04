@@ -1,17 +1,37 @@
 package seal
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/base64"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
-	"time"
+	"strconv"
 
 	"seal/internal/timeauth"
 )
+
+// extractTargetRound parses the target round from a key reference.
+// Supports both legacy drand JSON format and simple numeric format.
+func extractTargetRound(keyRef string) (uint64, error) {
+	// Try parsing as simple number first
+	if round, err := strconv.ParseUint(keyRef, 10, 64); err == nil {
+		return round, nil
+	}
+
+	// Try parsing as drand JSON format
+	var drandRef struct {
+		TargetRound uint64 `json:"target_round"`
+	}
+	if err := json.Unmarshal([]byte(keyRef), &drandRef); err != nil {
+		return 0, fmt.Errorf("failed to parse key reference: %w", err)
+	}
+
+	return drandRef.TargetRound, nil
+}
 
 // recoverPendingUnseal handles incomplete unseal transactions.
 // If unsealed.pending exists:
@@ -59,7 +79,7 @@ func recoverPendingUnseal(item SealedItem, itemDir string) error {
 //
 // Decrypted data is written to: <itemDir>/unsealed
 // This path must not exist while the item is in StateSealed state.
-func TryMaterialize(item SealedItem, itemDir string, authority timeauth.TimeAuthority) (SealedItem, error) {
+func TryMaterialize(item SealedItem, itemDir string, authority timeauth.Authority) (SealedItem, error) {
 	// Recover any incomplete transactions first
 	if err := recoverPendingUnseal(item, itemDir); err != nil {
 		return item, fmt.Errorf("failed to recover pending transaction: %w", err)
@@ -70,13 +90,22 @@ func TryMaterialize(item SealedItem, itemDir string, authority timeauth.TimeAuth
 		return item, nil
 	}
 
-	// Precondition: Only materialize drand authority items
-	if item.TimeAuthority != "drand" {
+	// Verify tlock-encrypted DEK exists
+	if item.DEKTlockB64 == "" {
+		// No encrypted DEK - this authority doesn't support time-lock encryption
 		return item, nil
 	}
 
-	// Precondition: Check if unlocking is allowed
-	canUnlock, err := authority.CanUnlock(timeauth.KeyReference(item.KeyRef), time.Now())
+	// Parse target round from key reference to check if unlocking is allowed
+	// KeyRef contains authority-specific metadata (e.g., target round for drand)
+	targetRound, err := extractTargetRound(item.KeyRef)
+	if err != nil {
+		// Cannot parse key reference - skip materialization
+		return item, nil
+	}
+
+	// Check if the target round has been reached
+	canUnlock, err := authority.CanUnlock(context.Background(), targetRound)
 	if err != nil {
 		// Network failure - do not unlock
 		return item, nil
@@ -87,19 +116,8 @@ func TryMaterialize(item SealedItem, itemDir string, authority timeauth.TimeAuth
 		return item, nil
 	}
 
-	// Verify tlock-encrypted DEK exists
-	if item.DEKTlockB64 == "" {
-		return item, errors.New("tlock-encrypted DEK not found")
-	}
-
-	// Get the DrandAuthority to access its Timelock
-	drandAuth, ok := authority.(*timeauth.DrandAuthority)
-	if !ok {
-		return item, errors.New("expected DrandAuthority for drand items")
-	}
-
-	// Decrypt DEK using tlock (fetches drand beacon for target round)
-	dek, err := drandAuth.Timelock.Decrypt(item.DEKTlockB64)
+	// Decrypt DEK using time-lock decryption (fetches randomness for target round)
+	dek, err := authority.TimeLockDecrypt(context.Background(), item.DEKTlockB64)
 	if err != nil {
 		// Decryption failure (too early or network error) - do not unlock
 		return item, nil
@@ -196,16 +214,16 @@ func TryMaterialize(item SealedItem, itemDir string, authority timeauth.TimeAuth
 	return item, nil
 }
 
-// CheckAndTransitionUnlock wraps tryMaterialize with the appropriate authority.
+// CheckAndTransitionUnlock wraps TryMaterialize with the appropriate authority.
 func CheckAndTransitionUnlock(item SealedItem, itemDir string) (SealedItem, error) {
 	if item.State == StateUnlocked {
 		return item, nil
 	}
 
 	// Get authority based on item metadata
-	var authority timeauth.TimeAuthority
+	var authority timeauth.Authority
 	if item.TimeAuthority == "drand" {
-		authority = timeauth.NewDefaultDrandAuthority()
+		authority = timeauth.NewDefaultAuthority()
 	} else {
 		// Placeholder or unknown authority - no materialization
 		return item, nil

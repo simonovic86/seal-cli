@@ -193,7 +193,7 @@ func TestDrandAuthority_CanUnlock_Logic(t *testing.T) {
 			refJSON, _ := json.Marshal(tc.ref)
 			keyRef := KeyReference(refJSON)
 			
-			canUnlock, err := authority.CanUnlock(keyRef, time.Now())
+			canUnlock, err := authority.CanUnlockRef(keyRef, time.Now())
 			
 			if tc.shouldError && err == nil {
 				t.Error("expected error, got nil")
@@ -216,7 +216,7 @@ func TestDrandAuthority_InvalidKeyReference(t *testing.T) {
 	// Invalid JSON
 	invalidRef := KeyReference("not-valid-json")
 	
-	canUnlock, err := authority.CanUnlock(invalidRef, time.Now())
+	canUnlock, err := authority.CanUnlockRef(invalidRef, time.Now())
 	if err == nil {
 		t.Error("expected error for invalid key reference")
 	}
@@ -251,7 +251,7 @@ func TestDrandAuthority_NetworkFailure_DoesNotUnlock(t *testing.T) {
 	refJSON, _ := json.Marshal(ref)
 	keyRef := KeyReference(refJSON)
 	
-	canUnlock, err := authority.CanUnlock(keyRef, time.Now())
+	canUnlock, err := authority.CanUnlockRef(keyRef, time.Now())
 	
 	// Network failure should return error
 	if err == nil {

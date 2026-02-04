@@ -249,7 +249,7 @@ func ClearClipboard() []string {
 // Encrypts the payload using AES-256-GCM with a fresh DEK.
 // Uses the provided time authority to generate a key reference.
 // Returns the item ID and error.
-func CreateSealedItem(unlockTime time.Time, inputType InputSource, originalPath string, plaintext []byte, authority timeauth.TimeAuthority) (string, error) {
+func CreateSealedItem(unlockTime time.Time, inputType InputSource, originalPath string, plaintext []byte, authority timeauth.Authority) (string, error) {
 	baseDir, err := GetSealBaseDir()
 	if err != nil {
 		return "", err
@@ -272,10 +272,16 @@ func CreateSealedItem(unlockTime time.Time, inputType InputSource, originalPath 
 		}
 	}()
 
-	// Lock with time authority to get key reference
-	keyRef, err := authority.Lock(unlockTime)
+	// Calculate target round for unlock time
+	targetRound, err := authority.RoundAt(unlockTime)
 	if err != nil {
-		return "", fmt.Errorf("time authority lock failed: %w", err)
+		return "", fmt.Errorf("failed to calculate target round: %w", err)
+	}
+
+	// Time-lock encrypt the DEK to the target round
+	tlockB64, err := authority.TimeLockEncrypt(dek, targetRound)
+	if err != nil {
+		return "", fmt.Errorf("failed to time-lock encrypt DEK: %w", err)
 	}
 
 	// Generate UUID for this sealed item
@@ -285,6 +291,12 @@ func CreateSealedItem(unlockTime time.Time, inputType InputSource, originalPath 
 	// Create item directory
 	if err := os.Mkdir(itemDir, 0700); err != nil {
 		return "", fmt.Errorf("cannot create item directory: %w", err)
+	}
+
+	// Create key reference for metadata (authority-specific format preserved via Lock method)
+	keyRef, err := authority.Lock(unlockTime)
+	if err != nil {
+		return "", fmt.Errorf("failed to create key reference: %w", err)
 	}
 
 	// Create metadata
@@ -299,23 +311,7 @@ func CreateSealedItem(unlockTime time.Time, inputType InputSource, originalPath 
 		Algorithm:     "aes-256-gcm",
 		Nonce:         nonceB64,
 		KeyRef:        string(keyRef),
-	}
-
-	// For drand authority, use tlock to time-lock the DEK
-	if drandAuth, ok := authority.(*timeauth.DrandAuthority); ok {
-		var drandRef timeauth.DrandKeyReference
-		if err := json.Unmarshal([]byte(keyRef), &drandRef); err != nil {
-			return "", fmt.Errorf("failed to parse drand key reference: %w", err)
-		}
-
-		// Time-lock encrypt the DEK to the target round
-		tlockB64, err := drandAuth.Timelock.Encrypt(dek, drandRef.TargetRound)
-		if err != nil {
-			return "", err
-		}
-
-		// Store tlock-encrypted DEK in metadata (base64 encoded)
-		meta.DEKTlockB64 = tlockB64
+		DEKTlockB64:   tlockB64,
 	}
 
 	// Write metadata
@@ -368,8 +364,8 @@ func Lock(req LockRequest) (LockResult, error) {
 
 	var warnings []string
 
-	// Create time authority (default: drand quicknet)
-	authority := timeauth.NewDefaultDrandAuthority()
+	// Create time authority (default authority via factory)
+	authority := timeauth.NewDefaultAuthority()
 
 	// Create sealed item with encrypted payload
 	id, err := CreateSealedItem(unlockTime, inputSrc, req.InputPath, inputData, authority)
