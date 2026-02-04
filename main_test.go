@@ -2764,3 +2764,58 @@ func TestStatusCommand_NoSpecialMessageOnUnlock(t *testing.T) {
 		}
 	}
 }
+
+func TestListingDoesNotMaterialize(t *testing.T) {
+	// Setup: create a sealed item that is eligible for unlock
+	tmpHome := t.TempDir()
+	os.Setenv("HOME", tmpHome)
+	os.Setenv("XDG_DATA_HOME", "")
+	defer func() {
+		os.Unsetenv("HOME")
+		os.Unsetenv("XDG_DATA_HOME")
+	}()
+
+	// Create item with past unlock time (eligible for unlock)
+	pastTime := time.Now().UTC().Add(-1 * time.Hour)
+	authority := newTestDrandAuthority(999999) // High round number (already past)
+	
+	plaintext := []byte("test data that should unlock")
+	id, err := seal.CreateSealedItem(pastTime, seal.InputSourceStdin, "", plaintext, authority)
+	if err != nil {
+		t.Fatalf("failed to create sealed item: %v", err)
+	}
+
+	baseDir, _ := seal.GetSealBaseDir()
+	itemDir := filepath.Join(baseDir, id)
+	unsealedPath := filepath.Join(itemDir, "unsealed")
+
+	// Call ListSealedItems (read-only operation)
+	items, err := seal.ListSealedItems()
+	if err != nil {
+		t.Fatalf("ListSealedItems failed: %v", err)
+	}
+
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+
+	// Assert: item must remain sealed (no materialization happened)
+	if items[0].State != seal.StateSealed {
+		t.Errorf("expected state to be sealed, got %s", items[0].State)
+	}
+
+	// Assert: unsealed file must NOT exist
+	if _, err := os.Stat(unsealedPath); !os.IsNotExist(err) {
+		t.Error("unsealed file should not exist after listing")
+	}
+
+	// Verify metadata on disk still shows sealed
+	meta, err := os.ReadFile(filepath.Join(itemDir, "meta.json"))
+	if err != nil {
+		t.Fatalf("failed to read metadata: %v", err)
+	}
+
+	if !strings.Contains(string(meta), `"state": "sealed"`) {
+		t.Error("metadata should still show sealed state")
+	}
+}

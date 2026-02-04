@@ -290,7 +290,7 @@ func CreateSealedItem(unlockTime time.Time, inputType InputSource, originalPath 
 	// Create metadata
 	meta := SealedItem{
 		ID:            id,
-		State:         "sealed",
+		State:         StateSealed,
 		UnlockTime:    unlockTime.UTC(),
 		InputType:     inputType.String(),
 		OriginalPath:  originalPath,

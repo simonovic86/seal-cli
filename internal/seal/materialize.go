@@ -18,10 +18,10 @@ import (
 // Returns the item (potentially with updated state) and any error.
 //
 // Decrypted data is written to: <itemDir>/unsealed
-// This path must not exist while the item is in "sealed" state.
+// This path must not exist while the item is in StateSealed state.
 func TryMaterialize(item SealedItem, itemDir string, authority timeauth.TimeAuthority) (SealedItem, error) {
 	// Precondition: If already unlocked, no-op
-	if item.State == "unlocked" {
+	if item.State == StateUnlocked {
 		return item, nil
 	}
 
@@ -123,7 +123,7 @@ func TryMaterialize(item SealedItem, itemDir string, authority timeauth.TimeAuth
 	}
 
 	// Update state to unlocked
-	item.State = "unlocked"
+	item.State = StateUnlocked
 
 	// Persist updated state
 	if err := saveMetadata(itemDir, item); err != nil {
@@ -135,7 +135,7 @@ func TryMaterialize(item SealedItem, itemDir string, authority timeauth.TimeAuth
 
 // CheckAndTransitionUnlock wraps tryMaterialize with the appropriate authority.
 func CheckAndTransitionUnlock(item SealedItem, itemDir string) (SealedItem, error) {
-	if item.State == "unlocked" {
+	if item.State == StateUnlocked {
 		return item, nil
 	}
 

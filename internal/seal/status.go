@@ -1,9 +1,7 @@
 package seal
 
 import (
-	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 )
 
@@ -37,9 +35,9 @@ func GetStatus() (StatusResult, error) {
 	// Attempt materialization for each item, then report post-materialization state
 	for i := range items {
 		itemDir := filepath.Join(baseDir, items[i].ID)
-		originalState := items[i].State
 		
 		// Attempt materialization (idempotent - no-op if already unlocked)
+		// CheckAndTransitionUnlock handles metadata persistence via saveMetadata
 		updatedItem, err := CheckAndTransitionUnlock(items[i], itemDir)
 		if err != nil {
 			// Track error but continue processing other items
@@ -51,13 +49,6 @@ func GetStatus() (StatusResult, error) {
 		} else {
 			// Update to post-materialization state
 			items[i] = updatedItem
-			
-			// Persist state change if it occurred
-			if updatedItem.State != originalState {
-				metaPath := filepath.Join(itemDir, "meta.json")
-				metaData, _ := json.MarshalIndent(updatedItem, "", "  ")
-				os.WriteFile(metaPath, metaData, 0600)
-			}
 		}
 	}
 

@@ -37,13 +37,7 @@ func ListSealedItems() ([]SealedItem, error) {
 			continue
 		}
 
-		// Check and potentially transition unlock state (currently inert)
-		item, err = CheckAndTransitionUnlock(item, itemDir)
-		if err != nil {
-			// Skip items that fail unlock check
-			continue
-		}
-
+		// ListSealedItems is read-only: return persisted state without materialization
 		items = append(items, item)
 	}
 

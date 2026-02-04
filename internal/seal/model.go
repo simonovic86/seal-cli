@@ -6,6 +6,12 @@ const (
 	MaxInputSize = 10 * 1024 * 1024 // 10MB
 )
 
+// State constants for sealed items
+const (
+	StateSealed   = "sealed"
+	StateUnlocked = "unlocked"
+)
+
 type InputSource int
 
 const (
