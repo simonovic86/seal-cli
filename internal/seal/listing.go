@@ -38,6 +38,7 @@ func ListSealedItems() ([]SealedItem, error) {
 		}
 
 		// ListSealedItems is read-only: return persisted state without materialization
+		// Recovery of pending transactions happens in status flow (write-enabled)
 		items = append(items, item)
 	}
 
