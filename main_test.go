@@ -16,6 +16,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"seal/internal/seal"
+	"seal/internal/timeauth"
 )
 
 // FakeHTTPDoer is a mock HTTP client for testing.
@@ -63,7 +66,14 @@ func cloneResponse(resp *http.Response) *http.Response {
 
 // makeDrandInfoResponse creates a fake drand /info response.
 func makeDrandInfoResponse() *http.Response {
-	info := drandInfo{
+	info := struct {
+		Period      int    `json:"period"`
+		GenesisTime int64  `json:"genesis_time"`
+		Hash        string `json:"hash"`
+		GroupHash   string `json:"groupHash"`
+		SchemeID    string `json:"schemeID"`
+		BeaconID    string `json:"beaconID"`
+	}{
 		Period:      3,
 		GenesisTime: 1677685200, // Fixed genesis time for deterministic tests
 		Hash:        "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971",
@@ -79,7 +89,10 @@ func makeDrandInfoResponse() *http.Response {
 
 // makeDrandPublicResponse creates a fake drand /public/latest or /public/<round> response.
 func makeDrandPublicResponse(round uint64) *http.Response {
-	resp := drandPublicResponse{
+	resp := struct {
+		Round      uint64 `json:"round"`
+		Randomness string `json:"randomness"`
+	}{
 		Round:      round,
 		Randomness: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
 	}
@@ -125,7 +138,7 @@ func (f *FakeTimelockBox) Decrypt(ciphertextB64 string) ([]byte, error) {
 }
 
 // newTestDrandAuthority creates a DrandAuthority with fake HTTP and tlock for testing.
-func newTestDrandAuthority(currentRound uint64) *DrandAuthority {
+func newTestDrandAuthority(currentRound uint64) *timeauth.DrandAuthority {
 	fakeHTTP := &FakeHTTPDoer{
 		Responses: map[string]*http.Response{
 			"/info":           makeDrandInfoResponse(),
@@ -133,11 +146,11 @@ func newTestDrandAuthority(currentRound uint64) *DrandAuthority {
 		},
 	}
 
-	return NewDrandAuthorityWithDeps(fakeHTTP, &FakeTimelockBox{})
+	return timeauth.NewDrandAuthorityWithDeps(fakeHTTP, &FakeTimelockBox{})
 }
 
 // newTestDrandAuthorityWithRoundResponses creates a DrandAuthority with specific round responses.
-func newTestDrandAuthorityWithRoundResponses(currentRound uint64, roundResponses map[uint64]*http.Response) *DrandAuthority {
+func newTestDrandAuthorityWithRoundResponses(currentRound uint64, roundResponses map[uint64]*http.Response) *timeauth.DrandAuthority {
 	fakeHTTP := &FakeHTTPDoer{
 		Responses: map[string]*http.Response{
 			"/info":          makeDrandInfoResponse(),
@@ -149,14 +162,14 @@ func newTestDrandAuthorityWithRoundResponses(currentRound uint64, roundResponses
 		fakeHTTP.Responses["/public/"+string(rune(round))] = resp
 	}
 
-	return NewDrandAuthorityWithDeps(fakeHTTP, &FakeTimelockBox{})
+	return timeauth.NewDrandAuthorityWithDeps(fakeHTTP, &FakeTimelockBox{})
 }
 
 func TestParseUnlockTime_ValidUTC(t *testing.T) {
 	future := time.Now().UTC().Add(24 * time.Hour)
 	input := future.Format(time.RFC3339)
 
-	result, err := parseUnlockTime(input)
+	result, err := seal.ParseUnlockTime(input)
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -178,7 +191,7 @@ func TestParseUnlockTime_ValidWithOffset(t *testing.T) {
 	futureWithOffset := future.In(loc)
 	input := futureWithOffset.Format(time.RFC3339)
 
-	result, err := parseUnlockTime(input)
+	result, err := seal.ParseUnlockTime(input)
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -209,7 +222,7 @@ func TestParseUnlockTime_InvalidFormat(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := parseUnlockTime(tc.input)
+			_, err := seal.ParseUnlockTime(tc.input)
 			if err == nil {
 				t.Errorf("expected error for input %q, got nil", tc.input)
 			}
@@ -232,7 +245,7 @@ func TestParseUnlockTime_PastTimestamp(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := parseUnlockTime(tc.input)
+			_, err := seal.ParseUnlockTime(tc.input)
 			if err == nil {
 				t.Errorf("expected error for past timestamp %q, got nil", tc.input)
 			}
@@ -248,7 +261,7 @@ func TestParseUnlockTime_EdgeCaseCloseToNow(t *testing.T) {
 	future := time.Now().UTC().Add(1 * time.Second)
 	input := future.Format(time.RFC3339)
 
-	result, err := parseUnlockTime(input)
+	result, err := seal.ParseUnlockTime(input)
 	if err != nil {
 		t.Fatalf("expected no error for future time, got: %v", err)
 	}
@@ -266,7 +279,7 @@ func TestParseUnlockTime_ExactlyNow(t *testing.T) {
 	// Sleep a tiny bit to ensure "now" is definitely not in the future
 	time.Sleep(1 * time.Millisecond)
 
-	_, err := parseUnlockTime(input)
+	_, err := seal.ParseUnlockTime(input)
 	if err == nil {
 		t.Error("expected error for timestamp at or before now, got nil")
 	}
@@ -293,7 +306,7 @@ func TestParseUnlockTime_NormalizesToUTC(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			input := baseTime.In(tc.loc).Format(time.RFC3339)
-			result, err := parseUnlockTime(input)
+			result, err := seal.ParseUnlockTime(input)
 			if err != nil {
 				t.Fatalf("expected no error, got: %v", err)
 			}
@@ -327,13 +340,13 @@ func TestReadInput_FileValid(t *testing.T) {
 		t.Fatalf("failed to create test file: %v", err)
 	}
 
-	data, source, err := readInput(testFile)
+	data, source, err := seal.ReadInput(testFile)
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
 
-	if source != inputSourceFile {
-		t.Errorf("expected source to be inputSourceFile, got: %v", source)
+	if source != seal.InputSourceFile {
+		t.Errorf("expected source to be seal.InputSourceFile, got: %v", source)
 	}
 
 	if !bytes.Equal(data, testContent) {
@@ -360,13 +373,13 @@ func TestReadInput_StdinValid(t *testing.T) {
 
 	os.Stdin = r
 
-	data, source, err := readInput("")
+	data, source, err := seal.ReadInput("")
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
 
-	if source != inputSourceStdin {
-		t.Errorf("expected source to be inputSourceStdin, got: %v", source)
+	if source != seal.InputSourceStdin {
+		t.Errorf("expected source to be seal.InputSourceStdin, got: %v", source)
 	}
 
 	if !bytes.Equal(data, testContent) {
@@ -400,7 +413,7 @@ func TestReadInput_BothFileAndStdin(t *testing.T) {
 
 	os.Stdin = r
 
-	_, _, err = readInput(testFile)
+	_, _, err = seal.ReadInput(testFile)
 	if err == nil {
 		t.Fatal("expected error when both file and stdin provided, got nil")
 	}
@@ -426,7 +439,7 @@ func TestReadInput_NeitherFileNorStdin(t *testing.T) {
 	// For testing, we'll just check the actual error
 	os.Stdin = oldStdin // Use actual stdin (which is typically a character device in tests)
 
-	_, _, err = readInput("")
+	_, _, err = seal.ReadInput("")
 	if err == nil {
 		t.Fatal("expected error when neither file nor stdin provided, got nil")
 	}
@@ -448,7 +461,7 @@ func TestReadInput_EmptyFile(t *testing.T) {
 		t.Fatalf("failed to create test file: %v", err)
 	}
 
-	_, _, err = readInput(testFile)
+	_, _, err = seal.ReadInput(testFile)
 	if err == nil {
 		t.Fatal("expected error for empty file, got nil")
 	}
@@ -474,7 +487,7 @@ func TestReadInput_EmptyStdin(t *testing.T) {
 
 	os.Stdin = r
 
-	_, _, err = readInput("")
+	_, _, err = seal.ReadInput("")
 	if err == nil {
 		t.Fatal("expected error for empty stdin, got nil")
 	}
@@ -489,8 +502,8 @@ func TestReadInput_ExceedsMaxSize_File(t *testing.T) {
 	tmpDir := t.TempDir()
 	testFile := filepath.Join(tmpDir, "large.txt")
 
-	// Create a file larger than maxInputSize
-	largeContent := make([]byte, maxInputSize+1)
+	// Create a file larger than MaxInputSize
+	largeContent := make([]byte, seal.MaxInputSize+1)
 	for i := range largeContent {
 		largeContent[i] = 'A'
 	}
@@ -500,7 +513,7 @@ func TestReadInput_ExceedsMaxSize_File(t *testing.T) {
 		t.Fatalf("failed to create test file: %v", err)
 	}
 
-	_, _, err = readInput(testFile)
+	_, _, err = seal.ReadInput(testFile)
 	if err == nil {
 		t.Fatal("expected error for file exceeding size limit, got nil")
 	}
@@ -521,7 +534,7 @@ func TestReadInput_ExceedsMaxSize_Stdin(t *testing.T) {
 		t.Fatalf("failed to create pipe: %v", err)
 	}
 
-	largeContent := make([]byte, maxInputSize+1)
+	largeContent := make([]byte, seal.MaxInputSize+1)
 	for i := range largeContent {
 		largeContent[i] = 'B'
 	}
@@ -533,7 +546,7 @@ func TestReadInput_ExceedsMaxSize_Stdin(t *testing.T) {
 
 	os.Stdin = r
 
-	_, _, err = readInput("")
+	_, _, err = seal.ReadInput("")
 	if err == nil {
 		t.Fatal("expected error for stdin exceeding size limit, got nil")
 	}
@@ -547,7 +560,7 @@ func TestReadInput_FileDoesNotExist(t *testing.T) {
 	tmpDir := t.TempDir()
 	nonExistentFile := filepath.Join(tmpDir, "does-not-exist.txt")
 
-	_, _, err := readInput(nonExistentFile)
+	_, _, err := seal.ReadInput(nonExistentFile)
 	if err == nil {
 		t.Fatal("expected error for non-existent file, got nil")
 	}
@@ -572,7 +585,7 @@ func TestGetSealBaseDir_PlatformAgnostic(t *testing.T) {
 		os.Setenv("XDG_DATA_HOME", oldXDGDataHome)
 	}()
 
-	baseDir, err := getSealBaseDir()
+	baseDir, err := seal.GetSealBaseDir()
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -607,10 +620,10 @@ func TestCreateSealedItem_And_List(t *testing.T) {
 	testPayload := []byte("test sealed content")
 	testPath := "/test/path.txt"
 
-	authority := &PlaceholderAuthority{}
+	authority := &timeauth.PlaceholderAuthority{}
 
 	// Create sealed item
-	id, err := createSealedItem(unlockTime, inputSourceFile, testPath, testPayload, authority)
+	id, err := seal.CreateSealedItem(unlockTime, seal.InputSourceFile, testPath, testPayload, authority)
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -620,7 +633,7 @@ func TestCreateSealedItem_And_List(t *testing.T) {
 	}
 
 	// Verify directory structure
-	baseDir, _ := getSealBaseDir()
+	baseDir, _ := seal.GetSealBaseDir()
 	itemDir := filepath.Join(baseDir, id)
 
 	// Check item directory exists
@@ -635,7 +648,7 @@ func TestCreateSealedItem_And_List(t *testing.T) {
 		t.Fatalf("cannot read meta.json: %v", err)
 	}
 
-	var meta SealedItem
+	var meta seal.SealedItem
 	if err := json.Unmarshal(metaData, &meta); err != nil {
 		t.Fatalf("cannot unmarshal meta.json: %v", err)
 	}
@@ -695,7 +708,7 @@ func TestCreateSealedItem_And_List(t *testing.T) {
 	}
 
 	// List sealed items
-	items, err := listSealedItems()
+	items, err := seal.ListSealedItems()
 	if err != nil {
 		t.Fatalf("listSealedItems failed: %v", err)
 	}
@@ -714,7 +727,7 @@ func TestMetadata_RoundTrip(t *testing.T) {
 	unlockTime := time.Date(2027, 3, 15, 14, 30, 0, 0, time.UTC)
 	createdAt := time.Date(2026, 2, 1, 10, 0, 0, 0, time.UTC)
 
-	original := SealedItem{
+	original := seal.SealedItem{
 		ID:            "test-id-123",
 		State:         "sealed",
 		UnlockTime:    unlockTime,
@@ -734,7 +747,7 @@ func TestMetadata_RoundTrip(t *testing.T) {
 	}
 
 	// Unmarshal back
-	var decoded SealedItem
+	var decoded seal.SealedItem
 	if err := json.Unmarshal(jsonData, &decoded); err != nil {
 		t.Fatalf("unmarshal failed: %v", err)
 	}
@@ -795,7 +808,7 @@ func TestListSealedItems_Empty(t *testing.T) {
 	os.Setenv("HOME", tmpDir)
 	os.Setenv("XDG_DATA_HOME", "")
 
-	items, err := listSealedItems()
+	items, err := seal.ListSealedItems()
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -820,14 +833,14 @@ func TestListSealedItems_MultipleSorted(t *testing.T) {
 	os.Setenv("XDG_DATA_HOME", "")
 
 	unlockTime := time.Now().UTC().Add(24 * time.Hour)
-	authority := &PlaceholderAuthority{}
+	authority := &timeauth.PlaceholderAuthority{}
 	
 	// Create multiple items with slight delays to ensure different creation times
 	var ids []string
 	for i := 0; i < 3; i++ {
-		id, err := createSealedItem(
+		id, err := seal.CreateSealedItem(
 			unlockTime.Add(time.Duration(i)*time.Hour),
-			inputSourceStdin,
+			seal.InputSourceStdin,
 			"",
 			[]byte("test content "+string(rune('A'+i))),
 			authority,
@@ -842,7 +855,7 @@ func TestListSealedItems_MultipleSorted(t *testing.T) {
 	}
 
 	// List items
-	items, err := listSealedItems()
+	items, err := seal.ListSealedItems()
 	if err != nil {
 		t.Fatalf("listSealedItems failed: %v", err)
 	}
@@ -873,12 +886,12 @@ func TestListSealedItems_MultipleSorted(t *testing.T) {
 }
 
 func TestInputSource_String(t *testing.T) {
-	if inputSourceFile.String() != "file" {
-		t.Errorf("expected 'file', got %s", inputSourceFile.String())
+	if seal.InputSourceFile.String() != "file" {
+		t.Errorf("expected 'file', got %s", seal.InputSourceFile.String())
 	}
 
-	if inputSourceStdin.String() != "stdin" {
-		t.Errorf("expected 'stdin', got %s", inputSourceStdin.String())
+	if seal.InputSourceStdin.String() != "stdin" {
+		t.Errorf("expected 'stdin', got %s", seal.InputSourceStdin.String())
 	}
 }
 
@@ -915,7 +928,7 @@ func decryptPayloadForTest(ciphertext []byte, nonceB64 string, key []byte) ([]by
 func TestEncryptPayload_ProducesNonPlaintext(t *testing.T) {
 	plaintext := []byte("this is a secret message")
 
-	ciphertext, nonceB64, dek, err := encryptPayload(plaintext)
+	ciphertext, nonceB64, dek, err := seal.EncryptPayload(plaintext)
 	if err != nil {
 		t.Fatalf("encryptPayload failed: %v", err)
 	}
@@ -979,7 +992,7 @@ func TestEncryptPayload_RoundTrip(t *testing.T) {
 
 			// Now we get the DEK back, so we can test round-trip
 
-			ciphertext, nonceB64, dek, err := encryptPayload(tc.plaintext)
+			ciphertext, nonceB64, dek, err := seal.EncryptPayload(tc.plaintext)
 			if err != nil {
 				t.Fatalf("encryption failed: %v", err)
 			}
@@ -1019,7 +1032,7 @@ func TestEncryptPayload_DifferentNoncesEachTime(t *testing.T) {
 	// Encrypt multiple times
 	var nonces []string
 	for i := 0; i < 5; i++ {
-		_, nonceB64, dek, err := encryptPayload(plaintext)
+		_, nonceB64, dek, err := seal.EncryptPayload(plaintext)
 		if err != nil {
 			t.Fatalf("encryption %d failed: %v", i, err)
 		}
@@ -1046,7 +1059,7 @@ func TestEncryptPayload_DifferentCiphertextEachTime(t *testing.T) {
 	// Encrypt multiple times
 	var ciphertexts [][]byte
 	for i := 0; i < 5; i++ {
-		ciphertext, _, dek, err := encryptPayload(plaintext)
+		ciphertext, _, dek, err := seal.EncryptPayload(plaintext)
 		if err != nil {
 			t.Fatalf("encryption %d failed: %v", i, err)
 		}
@@ -1082,22 +1095,22 @@ func TestCreateSealedItem_EncryptsPayload(t *testing.T) {
 
 	unlockTime := time.Now().UTC().Add(24 * time.Hour)
 	plaintext := []byte("secret data to seal")
-	authority := &PlaceholderAuthority{}
+	authority := &timeauth.PlaceholderAuthority{}
 
-	id, err := createSealedItem(unlockTime, inputSourceStdin, "", plaintext, authority)
+	id, err := seal.CreateSealedItem(unlockTime, seal.InputSourceStdin, "", plaintext, authority)
 	if err != nil {
 		t.Fatalf("createSealedItem failed: %v", err)
 	}
 
 	// Read back the metadata
-	baseDir, _ := getSealBaseDir()
+	baseDir, _ := seal.GetSealBaseDir()
 	metaPath := filepath.Join(baseDir, id, "meta.json")
 	metaData, err := os.ReadFile(metaPath)
 	if err != nil {
 		t.Fatalf("failed to read metadata: %v", err)
 	}
 
-	var meta SealedItem
+	var meta seal.SealedItem
 	if err := json.Unmarshal(metaData, &meta); err != nil {
 		t.Fatalf("failed to unmarshal metadata: %v", err)
 	}
@@ -1147,7 +1160,7 @@ func TestMetadata_IncludesCryptoFields(t *testing.T) {
 	unlockTime := time.Date(2027, 3, 15, 14, 30, 0, 0, time.UTC)
 	createdAt := time.Date(2026, 2, 1, 10, 0, 0, 0, time.UTC)
 
-	meta := SealedItem{
+	meta := seal.SealedItem{
 		ID:            "test-id-123",
 		State:         "sealed",
 		UnlockTime:    unlockTime,
@@ -1167,7 +1180,7 @@ func TestMetadata_IncludesCryptoFields(t *testing.T) {
 	}
 
 	// Unmarshal back
-	var decoded SealedItem
+	var decoded seal.SealedItem
 	if err := json.Unmarshal(jsonData, &decoded); err != nil {
 		t.Fatalf("unmarshal failed: %v", err)
 	}
@@ -1189,7 +1202,7 @@ func TestMetadata_IncludesCryptoFields(t *testing.T) {
 func TestLockCommand_OutputContract_Success(t *testing.T) {
 	// Build the binary for testing with testmode (uses mock drand)
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath, "./cmd/seal")
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}
@@ -1247,7 +1260,7 @@ func TestLockCommand_OutputContract_Success(t *testing.T) {
 func TestLockCommand_OutputContract_Error(t *testing.T) {
 	// Build the binary for testing with testmode
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath, "./cmd/seal")
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}
@@ -1315,7 +1328,7 @@ func TestLockCommand_OutputContract_NoExtraOutput(t *testing.T) {
 	// This test ensures there are no warnings, informational messages,
 	// or any other output on success
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath, "./cmd/seal")
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}
@@ -1380,7 +1393,7 @@ func TestShredFile_RemovesFile(t *testing.T) {
 		t.Fatal("test file should exist before shredding")
 	}
 
-	warnings := shredFile(testFile)
+	warnings := seal.ShredFile(testFile)
 
 	// Should complete without warnings
 	if len(warnings) > 0 {
@@ -1396,7 +1409,7 @@ func TestShredFile_RemovesFile(t *testing.T) {
 func TestShredFile_HandlesErrors(t *testing.T) {
 	// Try to shred a non-existent file
 	nonExistent := "/tmp/seal-test-nonexistent-file-for-shred.txt"
-	warnings := shredFile(nonExistent)
+	warnings := seal.ShredFile(nonExistent)
 
 	// Should return warnings but not panic
 	if len(warnings) == 0 {
@@ -1411,7 +1424,7 @@ func TestShredFile_HandlesErrors(t *testing.T) {
 
 func TestLockCommand_Shred_Success(t *testing.T) {
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath, "./cmd/seal")
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}
@@ -1463,7 +1476,7 @@ func TestLockCommand_Shred_Success(t *testing.T) {
 
 func TestLockCommand_Shred_FailureDoesNotAbortSealing(t *testing.T) {
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath, "./cmd/seal")
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}
@@ -1519,7 +1532,7 @@ func TestLockCommand_Shred_FailureDoesNotAbortSealing(t *testing.T) {
 
 func TestLockCommand_Shred_ErrorWithStdin(t *testing.T) {
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath, "./cmd/seal")
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}
@@ -1555,7 +1568,7 @@ func TestLockCommand_Shred_ErrorWithStdin(t *testing.T) {
 
 func TestLockCommand_Shred_WarningNotSuppressible(t *testing.T) {
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath, "./cmd/seal")
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}
@@ -1596,7 +1609,7 @@ func TestLockCommand_Shred_WarningNotSuppressible(t *testing.T) {
 
 func TestClearClipboard_BestEffort(t *testing.T) {
 	// Test that clearClipboard doesn't panic and returns warnings on unsupported platforms
-	warnings := clearClipboard()
+	warnings := seal.ClearClipboard()
 
 	// On macOS, it may succeed (no warnings) or fail (warnings)
 	// On other platforms, it should warn about not being implemented
@@ -1615,7 +1628,7 @@ func TestClearClipboard_BestEffort(t *testing.T) {
 
 func TestLockCommand_ClearClipboard_Success(t *testing.T) {
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath, "./cmd/seal")
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}
@@ -1653,7 +1666,7 @@ func TestLockCommand_ClearClipboard_Success(t *testing.T) {
 
 func TestLockCommand_ClearClipboard_ErrorWithFile(t *testing.T) {
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath, "./cmd/seal")
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}
@@ -1693,7 +1706,7 @@ func TestLockCommand_ClearClipboard_ErrorWithFile(t *testing.T) {
 
 func TestLockCommand_ClearClipboard_WarningNotSuppressible(t *testing.T) {
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath, "./cmd/seal")
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}
@@ -1730,7 +1743,7 @@ func TestLockCommand_ClearClipboard_WarningNotSuppressible(t *testing.T) {
 
 func TestLockCommand_ClearClipboard_FailureDoesNotAbortSealing(t *testing.T) {
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath, "./cmd/seal")
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}
@@ -1769,7 +1782,7 @@ func TestLockCommand_ClearClipboard_FailureDoesNotAbortSealing(t *testing.T) {
 }
 
 func TestPlaceholderAuthority_Name(t *testing.T) {
-	authority := &PlaceholderAuthority{}
+	authority := &timeauth.PlaceholderAuthority{}
 	
 	if authority.Name() != "placeholder" {
 		t.Errorf("expected name 'placeholder', got %s", authority.Name())
@@ -1777,7 +1790,7 @@ func TestPlaceholderAuthority_Name(t *testing.T) {
 }
 
 func TestPlaceholderAuthority_Lock(t *testing.T) {
-	authority := &PlaceholderAuthority{}
+	authority := &timeauth.PlaceholderAuthority{}
 	unlockTime := time.Now().UTC().Add(24 * time.Hour)
 
 	ref, err := authority.Lock(unlockTime)
@@ -1796,8 +1809,8 @@ func TestPlaceholderAuthority_Lock(t *testing.T) {
 }
 
 func TestPlaceholderAuthority_CanUnlock_AlwaysFalse(t *testing.T) {
-	authority := &PlaceholderAuthority{}
-	ref := KeyReference("placeholder-key-ref")
+	authority := &timeauth.PlaceholderAuthority{}
+	ref := timeauth.KeyReference("placeholder-key-ref")
 
 	testCases := []struct {
 		name string
@@ -1836,22 +1849,22 @@ func TestCreateSealedItem_StoresAuthorityMetadata(t *testing.T) {
 
 	unlockTime := time.Now().UTC().Add(24 * time.Hour)
 	plaintext := []byte("test data")
-	authority := &PlaceholderAuthority{}
+	authority := &timeauth.PlaceholderAuthority{}
 
-	id, err := createSealedItem(unlockTime, inputSourceStdin, "", plaintext, authority)
+	id, err := seal.CreateSealedItem(unlockTime, seal.InputSourceStdin, "", plaintext, authority)
 	if err != nil {
 		t.Fatalf("createSealedItem failed: %v", err)
 	}
 
 	// Read back metadata
-	baseDir, _ := getSealBaseDir()
+	baseDir, _ := seal.GetSealBaseDir()
 	metaPath := filepath.Join(baseDir, id, "meta.json")
 	metaData, err := os.ReadFile(metaPath)
 	if err != nil {
 		t.Fatalf("failed to read metadata: %v", err)
 	}
 
-	var meta SealedItem
+	var meta seal.SealedItem
 	if err := json.Unmarshal(metaData, &meta); err != nil {
 		t.Fatalf("failed to unmarshal metadata: %v", err)
 	}
@@ -1880,22 +1893,22 @@ func TestSealedItem_StateDefaultsToSealed(t *testing.T) {
 
 	unlockTime := time.Now().UTC().Add(24 * time.Hour)
 	plaintext := []byte("test data")
-	authority := &PlaceholderAuthority{}
+	authority := &timeauth.PlaceholderAuthority{}
 
-	id, err := createSealedItem(unlockTime, inputSourceStdin, "", plaintext, authority)
+	id, err := seal.CreateSealedItem(unlockTime, seal.InputSourceStdin, "", plaintext, authority)
 	if err != nil {
 		t.Fatalf("createSealedItem failed: %v", err)
 	}
 
 	// Read metadata
-	baseDir, _ := getSealBaseDir()
+	baseDir, _ := seal.GetSealBaseDir()
 	metaPath := filepath.Join(baseDir, id, "meta.json")
 	metaData, err := os.ReadFile(metaPath)
 	if err != nil {
 		t.Fatalf("failed to read metadata: %v", err)
 	}
 
-	var meta SealedItem
+	var meta seal.SealedItem
 	if err := json.Unmarshal(metaData, &meta); err != nil {
 		t.Fatalf("failed to unmarshal metadata: %v", err)
 	}
@@ -1920,15 +1933,15 @@ func TestUnsealedPath_NeverCreated(t *testing.T) {
 
 	unlockTime := time.Now().UTC().Add(24 * time.Hour)
 	plaintext := []byte("test data")
-	authority := &PlaceholderAuthority{}
+	authority := &timeauth.PlaceholderAuthority{}
 
-	id, err := createSealedItem(unlockTime, inputSourceStdin, "", plaintext, authority)
+	id, err := seal.CreateSealedItem(unlockTime, seal.InputSourceStdin, "", plaintext, authority)
 	if err != nil {
 		t.Fatalf("createSealedItem failed: %v", err)
 	}
 
 	// Verify unsealed path does not exist
-	baseDir, _ := getSealBaseDir()
+	baseDir, _ := seal.GetSealBaseDir()
 	unsealedPath := filepath.Join(baseDir, id, "unsealed")
 
 	if _, err := os.Stat(unsealedPath); !os.IsNotExist(err) {
@@ -1936,7 +1949,7 @@ func TestUnsealedPath_NeverCreated(t *testing.T) {
 	}
 
 	// List items (which calls checkAndTransitionUnlock)
-	items, err := listSealedItems()
+	items, err := seal.ListSealedItems()
 	if err != nil {
 		t.Fatalf("listSealedItems failed: %v", err)
 	}
@@ -1964,7 +1977,7 @@ func TestCheckAndTransitionUnlock_Inert(t *testing.T) {
 	createdAt := time.Now().UTC()
 
 	// Test with sealed item
-	sealedItem := SealedItem{
+	sealedItem := seal.SealedItem{
 		ID:            "test-id",
 		State:         "sealed",
 		UnlockTime:    unlockTime,
@@ -1976,7 +1989,7 @@ func TestCheckAndTransitionUnlock_Inert(t *testing.T) {
 		KeyRef:        "test-ref",
 	}
 
-	result, err := checkAndTransitionUnlock(sealedItem, itemDir)
+	result, err := seal.CheckAndTransitionUnlock(sealedItem, itemDir)
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -1987,7 +2000,7 @@ func TestCheckAndTransitionUnlock_Inert(t *testing.T) {
 	}
 
 	// Test with already unlocked item
-	unlockedItem := SealedItem{
+	unlockedItem := seal.SealedItem{
 		ID:            "test-id-2",
 		State:         "unlocked",
 		UnlockTime:    unlockTime,
@@ -1999,7 +2012,7 @@ func TestCheckAndTransitionUnlock_Inert(t *testing.T) {
 		KeyRef:        "test-ref",
 	}
 
-	result, err = checkAndTransitionUnlock(unlockedItem, itemDir)
+	result, err = seal.CheckAndTransitionUnlock(unlockedItem, itemDir)
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -2031,7 +2044,7 @@ func TestDrandAuthority_KeyReference_Structure(t *testing.T) {
 	}
 
 	// Parse the reference
-	var drandRef DrandKeyReference
+	var drandRef timeauth.DrandKeyReference
 	if err := json.Unmarshal([]byte(ref), &drandRef); err != nil {
 		t.Fatalf("key reference should be valid JSON: %v", err)
 	}
@@ -2053,14 +2066,14 @@ func TestDrandAuthority_KeyReference_Structure(t *testing.T) {
 func TestDrandAuthority_CanUnlock_Logic(t *testing.T) {
 	testCases := []struct {
 		name         string
-		ref          DrandKeyReference
+		ref          timeauth.DrandKeyReference
 		currentRound uint64
 		shouldError  bool
 		canUnlock    bool
 	}{
 		{
 			name: "valid reference, round reached",
-			ref: DrandKeyReference{
+			ref: timeauth.DrandKeyReference{
 				Network:     "quicknet",
 				TargetRound: 1000,
 			},
@@ -2070,7 +2083,7 @@ func TestDrandAuthority_CanUnlock_Logic(t *testing.T) {
 		},
 		{
 			name: "valid reference, round not reached",
-			ref: DrandKeyReference{
+			ref: timeauth.DrandKeyReference{
 				Network:     "quicknet",
 				TargetRound: 2000,
 			},
@@ -2080,7 +2093,7 @@ func TestDrandAuthority_CanUnlock_Logic(t *testing.T) {
 		},
 		{
 			name: "wrong network",
-			ref: DrandKeyReference{
+			ref: timeauth.DrandKeyReference{
 				Network:     "wrong-network",
 				TargetRound: 1000,
 			},
@@ -2095,7 +2108,7 @@ func TestDrandAuthority_CanUnlock_Logic(t *testing.T) {
 			authority := newTestDrandAuthority(tc.currentRound)
 			
 			refJSON, _ := json.Marshal(tc.ref)
-			keyRef := KeyReference(refJSON)
+			keyRef := timeauth.KeyReference(refJSON)
 			
 			canUnlock, err := authority.CanUnlock(keyRef, time.Now())
 			
@@ -2118,7 +2131,7 @@ func TestDrandAuthority_InvalidKeyReference(t *testing.T) {
 	authority := newTestDrandAuthority(1000)
 	
 	// Invalid JSON
-	invalidRef := KeyReference("not-valid-json")
+	invalidRef := timeauth.KeyReference("not-valid-json")
 	
 	canUnlock, err := authority.CanUnlock(invalidRef, time.Now())
 	if err == nil {
@@ -2145,15 +2158,15 @@ func TestDrandAuthority_NetworkFailure_DoesNotUnlock(t *testing.T) {
 		},
 	}
 	
-	authority := NewDrandAuthorityWithDeps(fakeHTTP, &FakeTimelockBox{})
+	authority := timeauth.NewDrandAuthorityWithDeps(fakeHTTP, &FakeTimelockBox{})
 	
-	ref := DrandKeyReference{
+	ref := timeauth.DrandKeyReference{
 		Network:     "quicknet",
 		TargetRound: 1000,
 	}
 	
 	refJSON, _ := json.Marshal(ref)
-	keyRef := KeyReference(refJSON)
+	keyRef := timeauth.KeyReference(refJSON)
 	
 	canUnlock, err := authority.CanUnlock(keyRef, time.Now())
 	
@@ -2169,7 +2182,7 @@ func TestDrandAuthority_NetworkFailure_DoesNotUnlock(t *testing.T) {
 }
 
 func TestDrandKeyReference_Serialization(t *testing.T) {
-	ref := DrandKeyReference{
+	ref := timeauth.DrandKeyReference{
 		Network:     "quicknet",
 		TargetRound: 12345678,
 	}
@@ -2181,7 +2194,7 @@ func TestDrandKeyReference_Serialization(t *testing.T) {
 	}
 
 	// Unmarshal back
-	var decoded DrandKeyReference
+	var decoded timeauth.DrandKeyReference
 	if err := json.Unmarshal(jsonData, &decoded); err != nil {
 		t.Fatalf("unmarshal failed: %v", err)
 	}
@@ -2203,9 +2216,9 @@ func TestDrandAuthority_RoundCalculation(t *testing.T) {
 	authority := newTestDrandAuthority(1000)
 	
 	// Get info from our fake
-	info, err := authority.fetchInfo()
+	info, err := authority.FetchInfo()
 	if err != nil {
-		t.Fatalf("fetchInfo failed: %v", err)
+		t.Fatalf("FetchInfo failed: %v", err)
 	}
 
 	// Create a time based on genesis + known rounds
@@ -2218,7 +2231,7 @@ func TestDrandAuthority_RoundCalculation(t *testing.T) {
 		t.Fatalf("Lock failed: %v", err)
 	}
 
-	var drandRef DrandKeyReference
+	var drandRef timeauth.DrandKeyReference
 	if err := json.Unmarshal([]byte(ref), &drandRef); err != nil {
 		t.Fatalf("failed to parse reference: %v", err)
 	}
@@ -2250,20 +2263,20 @@ func TestCreateSealedItem_WithDrandAuthority(t *testing.T) {
 	plaintext := []byte("test data with drand")
 	authority := newTestDrandAuthority(1000)
 
-	id, err := createSealedItem(unlockTime, inputSourceStdin, "", plaintext, authority)
+	id, err := seal.CreateSealedItem(unlockTime, seal.InputSourceStdin, "", plaintext, authority)
 	if err != nil {
 		t.Fatalf("createSealedItem failed: %v", err)
 	}
 
 	// Read back metadata
-	baseDir, _ := getSealBaseDir()
+	baseDir, _ := seal.GetSealBaseDir()
 	metaPath := filepath.Join(baseDir, id, "meta.json")
 	metaData, err := os.ReadFile(metaPath)
 	if err != nil {
 		t.Fatalf("failed to read metadata: %v", err)
 	}
 
-	var meta SealedItem
+	var meta seal.SealedItem
 	if err := json.Unmarshal(metaData, &meta); err != nil {
 		t.Fatalf("failed to unmarshal metadata: %v", err)
 	}
@@ -2274,7 +2287,7 @@ func TestCreateSealedItem_WithDrandAuthority(t *testing.T) {
 	}
 
 	// Verify key_ref is valid JSON
-	var drandRef DrandKeyReference
+	var drandRef timeauth.DrandKeyReference
 	if err := json.Unmarshal([]byte(meta.KeyRef), &drandRef); err != nil {
 		t.Fatalf("key_ref should be valid DrandKeyReference JSON: %v", err)
 	}
@@ -2325,20 +2338,20 @@ func TestCreateSealedItem_DrandAuthority_UsesTlock(t *testing.T) {
 	plaintext := []byte("test data")
 	authority := newTestDrandAuthority(1000)
 
-	id, err := createSealedItem(unlockTime, inputSourceStdin, "", plaintext, authority)
+	id, err := seal.CreateSealedItem(unlockTime, seal.InputSourceStdin, "", plaintext, authority)
 	if err != nil {
 		t.Fatalf("createSealedItem failed: %v", err)
 	}
 
 	// Read metadata
-	baseDir, _ := getSealBaseDir()
+	baseDir, _ := seal.GetSealBaseDir()
 	metaPath := filepath.Join(baseDir, id, "meta.json")
 	metaData, err := os.ReadFile(metaPath)
 	if err != nil {
 		t.Fatalf("failed to read metadata: %v", err)
 	}
 
-	var meta SealedItem
+	var meta seal.SealedItem
 	if err := json.Unmarshal(metaData, &meta); err != nil {
 		t.Fatalf("failed to unmarshal metadata: %v", err)
 	}
@@ -2365,16 +2378,16 @@ func TestMaterialize_PlaceholderAuthority_NoOp(t *testing.T) {
 	itemDir := filepath.Join(tmpDir, "test-item")
 	os.MkdirAll(itemDir, 0700)
 
-	item := SealedItem{
+	item := seal.SealedItem{
 		ID:            "test-id",
 		State:         "sealed",
 		UnlockTime:    time.Now().UTC().Add(-24 * time.Hour), // In the past
 		TimeAuthority: "placeholder",
 	}
 
-	authority := &PlaceholderAuthority{}
+	authority := &timeauth.PlaceholderAuthority{}
 
-	result, err := tryMaterialize(item, itemDir, authority)
+	result, err := seal.TryMaterialize(item, itemDir, authority)
 	if err != nil {
 		t.Fatalf("tryMaterialize should not error for placeholder: %v", err)
 	}
@@ -2395,7 +2408,7 @@ func TestMaterialize_AlreadyUnlocked_NoOp(t *testing.T) {
 	tmpDir := t.TempDir()
 	itemDir := filepath.Join(tmpDir, "test-item")
 
-	item := SealedItem{
+	item := seal.SealedItem{
 		ID:            "test-id",
 		State:         "unlocked",
 		TimeAuthority: "drand",
@@ -2403,7 +2416,7 @@ func TestMaterialize_AlreadyUnlocked_NoOp(t *testing.T) {
 
 	authority := newTestDrandAuthority(1000)
 
-	result, err := tryMaterialize(item, itemDir, authority)
+	result, err := seal.TryMaterialize(item, itemDir, authority)
 	if err != nil {
 		t.Fatalf("tryMaterialize should not error for unlocked item: %v", err)
 	}
@@ -2417,7 +2430,7 @@ func TestMaterialize_AlreadyUnlocked_NoOp(t *testing.T) {
 func TestLockCommand_DefaultsToDrandAuthority(t *testing.T) {
 	// Build the binary for testing with testmode
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath, "./cmd/seal")
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}
@@ -2461,7 +2474,7 @@ func TestLockCommand_DefaultsToDrandAuthority(t *testing.T) {
 		t.Fatalf("failed to read metadata: %v", err)
 	}
 
-	var meta SealedItem
+	var meta seal.SealedItem
 	if err := json.Unmarshal(metaData, &meta); err != nil {
 		t.Fatalf("failed to unmarshal metadata: %v", err)
 	}
@@ -2482,7 +2495,7 @@ func TestLockCommand_DefaultsToDrandAuthority(t *testing.T) {
 	}
 
 	// Verify key_ref is valid drand reference JSON
-	var drandRef DrandKeyReference
+	var drandRef timeauth.DrandKeyReference
 	if err := json.Unmarshal([]byte(meta.KeyRef), &drandRef); err != nil {
 		t.Fatalf("key_ref should be valid DrandKeyReference JSON: %v", err)
 	}
@@ -2513,15 +2526,15 @@ func TestPlaceholderSealedItems_NeverMaterialize(t *testing.T) {
 	// Create an item with placeholder authority (simulating old/test items)
 	unlockTime := time.Now().UTC().Add(-24 * time.Hour) // Already past
 	plaintext := []byte("test data sealed with placeholder")
-	authority := &PlaceholderAuthority{}
+	authority := &timeauth.PlaceholderAuthority{}
 
-	id, err := createSealedItem(unlockTime, inputSourceStdin, "", plaintext, authority)
+	id, err := seal.CreateSealedItem(unlockTime, seal.InputSourceStdin, "", plaintext, authority)
 	if err != nil {
 		t.Fatalf("createSealedItem failed: %v", err)
 	}
 
 	// List items (which triggers checkAndTransitionUnlock)
-	items, err := listSealedItems()
+	items, err := seal.ListSealedItems()
 	if err != nil {
 		t.Fatalf("listSealedItems failed: %v", err)
 	}
@@ -2536,7 +2549,7 @@ func TestPlaceholderSealedItems_NeverMaterialize(t *testing.T) {
 	}
 
 	// Verify unsealed file does not exist
-	baseDir, _ := getSealBaseDir()
+	baseDir, _ := seal.GetSealBaseDir()
 	unsealedPath := filepath.Join(baseDir, id, "unsealed")
 	if _, err := os.Stat(unsealedPath); !os.IsNotExist(err) {
 		t.Error("unsealed file should not exist for placeholder-sealed items")
@@ -2545,7 +2558,7 @@ func TestPlaceholderSealedItems_NeverMaterialize(t *testing.T) {
 	// Call checkAndTransitionUnlock directly multiple times
 	itemDir := filepath.Join(baseDir, id)
 	for i := 0; i < 3; i++ {
-		result, err := checkAndTransitionUnlock(items[0], itemDir)
+		result, err := seal.CheckAndTransitionUnlock(items[0], itemDir)
 		if err != nil {
 			t.Fatalf("checkAndTransitionUnlock should not error: %v", err)
 		}
@@ -2562,7 +2575,7 @@ func TestPlaceholderSealedItems_NeverMaterialize(t *testing.T) {
 
 func TestStatusCommand_BeforeUnlock_ReportsSealed(t *testing.T) {
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath, "./cmd/seal")
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}
@@ -2610,7 +2623,7 @@ func TestStatusCommand_BeforeUnlock_ReportsSealed(t *testing.T) {
 
 func TestStatusCommand_AfterUnlock_ReportsUnlocked(t *testing.T) {
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath, "./cmd/seal")
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}
@@ -2688,7 +2701,7 @@ func TestStatusCommand_AfterUnlock_ReportsUnlocked(t *testing.T) {
 
 func TestStatusCommand_NoSpecialMessageOnUnlock(t *testing.T) {
 	binPath := filepath.Join(t.TempDir(), "seal-test")
-	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath)
+	buildCmd := exec.Command("go", "build", "-tags", "testmode", "-o", binPath, "./cmd/seal")
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v\n%s", err, output)
 	}

@@ -1,6 +1,6 @@
 //go:build testmode
 
-package main
+package timeauth
 
 import (
 	"bytes"
@@ -20,7 +20,7 @@ func (t *testModeHTTPDoer) Do(req *http.Request) (*http.Response, error) {
 
 	// Handle /info endpoint
 	if strings.HasSuffix(path, "/info") {
-		info := drandInfo{
+		info := DrandInfo{
 			Period:      3,
 			GenesisTime: 1677685200,
 			Hash:        drandQuicknetChainHash,
@@ -75,7 +75,7 @@ func (t *testModeTimelockBox) Decrypt(ciphertextB64 string) ([]byte, error) {
 	return nil, io.ErrUnexpectedEOF
 }
 
-// newDefaultDrandAuthority creates a DrandAuthority for test mode.
-func newDefaultDrandAuthority() *DrandAuthority {
+// NewDefaultDrandAuthority creates a DrandAuthority for test mode.
+func NewDefaultDrandAuthority() *DrandAuthority {
 	return NewDrandAuthorityWithDeps(&testModeHTTPDoer{}, &testModeTimelockBox{})
 }
